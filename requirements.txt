@@ -1,0 +1,4 @@
+# Runtime dependencies only — this is what goes into the Docker image.
+# Versions are pinned so the image you test locally is the image that ships.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0

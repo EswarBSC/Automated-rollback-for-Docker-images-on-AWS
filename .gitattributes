@@ -1,0 +1,10 @@
+# Normalise line endings. Without this, a Windows checkout can commit CRLF into
+# shell scripts, and they then fail on Linux with "bad interpreter: /bin/bash^M".
+* text=auto eol=lf
+
+# Files that MUST be LF wherever they are checked out.
+*.sh      text eol=lf
+Dockerfile text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+*.py      text eol=lf

@@ -1,0 +1,191 @@
+# infra/ — the AWS pieces you create once, by hand
+
+This folder holds the JSON documents you paste into the AWS console. Nothing in
+here is applied automatically: there is no Terraform and no CDK in this project,
+on purpose, so that a beginner can see exactly which AWS objects exist and why.
+
+You set these up **once**. After that, every deploy and every rollback runs
+through GitHub Actions without anyone touching the console.
+
+| File | What it is | Where it goes |
+|---|---|---|
+| `github-actions-policy.json` | Least-privilege permissions policy for the GitHub Actions role | IAM → Policies → Create policy → JSON |
+| `ecs-infrastructure-trust-policy.json` | Trust policy letting the ECS service itself assume a role | IAM → Roles → Create role → Custom trust policy |
+
+Fixed values already filled in for you: account `010526241989`, region
+`eu-north-1` (Europe, Stockholm).
+
+---
+
+## Set-up order
+
+Do these in order — each step depends on the one before it.
+
+### 1. ECR repository — where images live
+
+**ECR → Repositories → Create repository**
+
+- Visibility: **Private**
+- Repository name: `rollback-demo`
+- Tag immutability: **Enabled** ← important. It guarantees that tag `abc1234`
+  can never be overwritten with different content, which is the whole basis of
+  "the old image is still exactly what we tested".
+
+### 2. CloudWatch log group — where container logs land
+
+**CloudWatch → Log groups → Create log group**
+
+- Name: `/ecs/rollback-demo` (must match `awslogs-group` in
+  `../ecs/task-definition.json`)
+- Retention: 1 week is plenty for a demo.
+
+If this group does not exist, tasks fail to start with a
+`ResourceInitializationError` about logging.
+
+### 3. `ecsTaskExecutionRole` — lets ECS pull images and write logs
+
+Most AWS accounts already have this role. Check **IAM → Roles → search
+`ecsTaskExecutionRole`**. If it is missing:
+
+**IAM → Roles → Create role**
+- Trusted entity type: **AWS service**
+- Use case: **Elastic Container Service** → **Elastic Container Service Task**
+- Permissions: attach the AWS managed policy
+  **`AmazonECSTaskExecutionRolePolicy`**
+- Role name: exactly `ecsTaskExecutionRole`
+
+This role is used by the ECS *agent* (to pull your image from ECR and ship logs
+to CloudWatch), not by your application code.
+
+### 4. GitHub OIDC identity provider — so GitHub needs no AWS keys
+
+**IAM → Identity providers → Add provider**
+- Provider type: **OpenID Connect**
+- Provider URL: `https://token.actions.githubusercontent.com`
+- Audience: `sts.amazonaws.com`
+
+This is what replaces access keys. GitHub presents a short-lived, signed token
+proving "I am a workflow running in repo X", and AWS trades it for temporary
+credentials that expire when the job ends. Nothing long-lived is ever stored in
+the repository.
+
+### 5. The permissions policy — paste `github-actions-policy.json`
+
+**IAM → Policies → Create policy → JSON tab**
+
+Delete whatever is in the editor and paste the entire contents of
+[`github-actions-policy.json`](github-actions-policy.json).
+
+- Name: `github-actions-rollback-demo-policy`
+
+What it allows, and why each piece is needed:
+
+| Statement | Why the pipeline needs it |
+|---|---|
+| `EcrGetAuthorizationToken` | `docker login` to ECR. This action only works on `"*"` — AWS does not support scoping it. |
+| `EcrPushAndPullThisRepositoryOnly` | Push the new image, and `DescribeImages` to check whether a tag already exists. Scoped to the `rollback-demo` repository only. |
+| `EcsTaskDefinitions` | Register each new revision and read existing ones. Task definitions have no "pre-creation" ARN to scope against, so `"*"` is required here. |
+| `EcsUpdateThisServiceOnly` | The actual deploy/rollback call. Scoped to exactly one service ARN — this role cannot touch any other service in the account. |
+| `EcsDeploymentControl` | Lets the Rollback workflow find an in-flight deployment and stop it with `--stop-type ROLLBACK`. |
+| `PassTaskExecutionRoleToEcsOnly` | Registering a task definition means handing `ecsTaskExecutionRole` to ECS. The condition `iam:PassedToService = ecs-tasks.amazonaws.com` means this role can only pass it to ECS, never to EC2 or Lambda — this is the classic privilege-escalation guard. |
+| `SsmRollbackPointer` | Read and write `/rollback-demo/prod/previous-taskdef`, the saved rollback target. |
+
+Note what is **absent**: no `ecr:DeleteRepository`, no `ecs:DeleteService`, no
+`iam:*`. A compromised workflow cannot delete your infrastructure.
+
+### 6. The GitHub Actions role — `github-actions-rollback-demo`
+
+**IAM → Roles → Create role → Custom trust policy**
+
+Paste this trust policy (it is repo-specific, which is why it is not a file in
+this folder):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::010526241989:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:EswarBSC/Automated-rollback-for-Docker-images-on-AWS:*"
+        }
+      }
+    }
+  ]
+}
+```
+
+- Attach the policy `github-actions-rollback-demo-policy` from step 5.
+- Role name: exactly `github-actions-rollback-demo`.
+- Copy the role ARN — it becomes the GitHub variable `AWS_ROLE_ARN`.
+
+The `sub` condition is the security boundary: only workflows in
+**your** repository can assume this role. Without it, any GitHub repository in
+the world could.
+
+> Tightening it further: replace `:*` with
+> `:ref:refs/heads/main` to allow only the main branch. Be aware that this also
+> blocks `workflow_dispatch` runs from other branches, so do it after the demo
+> works.
+
+### 7. SSM parameter — the rollback pointer
+
+**Systems Manager → Parameter Store → Create parameter**
+
+- Name: `/rollback-demo/prod/previous-taskdef`
+- Tier: Standard, Type: **String**
+- Value: `rollback-demo-task:1` (any placeholder — the deploy workflow
+  overwrites it on every deploy)
+
+The deploy workflow writes the **outgoing** revision here just before switching
+over. The rollback workflow reads it. That one string is what makes rollback a
+single click with no arguments.
+
+---
+
+## `ecs-infrastructure-trust-policy.json` — for blue/green later
+
+This trust policy allows the **ECS service itself** (`ecs.amazonaws.com`) to
+assume a role. It is different from every other role here:
+
+- `ecsTaskExecutionRole` is assumed by `ecs-tasks.amazonaws.com` (the task).
+- This one is assumed by `ecs.amazonaws.com` (the ECS control plane).
+
+You need it when you switch the service to the **blue/green deployment
+controller**, because ECS then has to reconfigure your load balancer listeners
+on your behalf.
+
+**To use it:** IAM → Roles → Create role → Custom trust policy → paste
+[`ecs-infrastructure-trust-policy.json`](ecs-infrastructure-trust-policy.json)
+→ attach the AWS managed policy
+**`AmazonECSInfrastructureRolePolicyForLoadBalancers`** → name it
+`ecsInfrastructureRole`. Then reference it as the service's *infrastructure
+role* when configuring blue/green.
+
+It is included now so the blue/green section of [`../docs/DEMO.md`](../docs/DEMO.md)
+is not blocked on an IAM task.
+
+---
+
+## About `../ecs/task-definition.json`
+
+That file is a **template**, not something you paste as-is:
+
+- `"image": "__IMAGE__"` is a placeholder. The deploy workflow replaces it with
+  the real ECR URI using `jq`, then registers the result.
+- It contains no JSON comments and no extra keys, because
+  `aws ecs register-task-definition` rejects any field it does not recognise —
+  including a well-meaning `"_comment"`.
+
+If you ever register it manually (for the very first service creation), replace
+`__IMAGE__` yourself with a real tag such as
+`010526241989.dkr.ecr.eu-north-1.amazonaws.com/rollback-demo:abc1234`.
+Never use `:latest` — a mutable tag makes it impossible to know what is running.

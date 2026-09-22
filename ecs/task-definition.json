@@ -1,0 +1,61 @@
+{
+  "family": "rollback-demo-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "executionRoleArn": "arn:aws:iam::010526241989:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "__IMAGE__",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "APP_ENV",
+          "value": "prod"
+        },
+        {
+          "name": "FAIL_HEALTH",
+          "value": "false"
+        },
+        {
+          "name": "SIMULATE_ERRORS",
+          "value": "false"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rollback-demo",
+          "awslogs-region": "eu-north-1",
+          "awslogs-stream-prefix": "app"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status == 200 else 1)\" || exit 1"
+        ],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 15
+      },
+      "stopTimeout": 30
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# Development/CI dependencies. Includes everything in requirements.txt so the
+# tests run against the exact same library versions as production.
+-r requirements.txt
+
+pytest==8.3.4
+httpx==0.28.1        # required by fastapi's TestClient

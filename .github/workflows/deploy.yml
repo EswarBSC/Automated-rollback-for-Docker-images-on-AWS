@@ -1,0 +1,383 @@
+# =============================================================================
+# Deploy - build once, test, then ship to ECS Fargate.
+#
+# The rules this workflow enforces:
+#   * every image is tagged with the 7-char git SHA. ":latest" is never used.
+#   * unit tests AND a smoke test against the real container must pass BEFORE
+#     the image is pushed to ECR.
+#   * before switching the service over, the CURRENT task definition revision is
+#     saved to SSM. That saved value is what the Rollback workflow returns to.
+#   * no AWS keys: GitHub assumes an IAM role through OIDC.
+#   * if the repository variable AWS_ROLE_ARN is empty, the AWS jobs are SKIPPED
+#     rather than failed, so your very first push still shows a green build.
+# =============================================================================
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      # Documentation-only commits must not trigger a production deploy.
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:        # lets you re-run a deploy by hand from the Actions tab
+
+permissions:
+  contents: read            # read the repo
+  id-token: write           # REQUIRED for OIDC: lets GitHub mint the token AWS trusts
+
+concurrency:
+  group: deploy-prod        # only one production deploy at a time...
+  cancel-in-progress: false # ...and never kill a deploy that is already half-applied
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. TEST - pure Python, no AWS involved. Always runs, even with no AWS setup.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip                                  # cache pip downloads between runs
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest -v
+
+  # ---------------------------------------------------------------------------
+  # 2. BUILD - build the image, smoke-test it, then push it to ECR.
+  #    Skipped entirely when AWS_ROLE_ARN is not configured yet.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build, smoke-test and push image
+    needs: test
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}   # full ECR URI, e.g. <acct>.dkr.ecr.eu-north-1.amazonaws.com/rollback-demo:abc1234
+      tag: ${{ steps.meta.outputs.tag }}       # just the 7-char SHA
+      reused: ${{ steps.exists.outputs.found }}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # OIDC: GitHub proves who it is to AWS and gets short-lived credentials.
+      # There are no access keys stored anywhere in this repository.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Work out the image tag and URI
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          # The 7-char git SHA is the image tag. It is unique, immutable and
+          # traceable straight back to a commit.
+          TAG="${GITHUB_SHA:0:7}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${ECR_REPOSITORY}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image for this commit: ${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+
+      # ECR tags should be immutable. If this exact tag is already there (e.g. you
+      # re-ran the workflow, or reverted and re-pushed the same tree), rebuilding
+      # would either fail or silently replace a tested artefact. So we reuse it.
+      - name: Does this tag already exist in ECR?
+        id: exists
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images \
+               --repository-name "$ECR_REPOSITORY" \
+               --image-ids "imageTag=$TAG" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Image tag ${TAG} is already in ECR. Skipping build and push - ECR tags are immutable, so this is the same tested image. Deploy will reuse it."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} not found in ECR - it will be built."
+          fi
+
+      - name: Build the image
+        if: steps.exists.outputs.found == 'false'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # --build-arg GIT_SHA bakes the version into the image itself.
+          docker build --build-arg "GIT_SHA=${TAG}" -t "$IMAGE" .
+
+      # SMOKE TEST - the gate that stops a broken image ever reaching ECR.
+      # Unit tests prove the code works; this proves the *image* actually boots
+      # and serves traffic, which catches bad Dockerfiles, missing files and
+      # wrong start commands.
+      - name: Smoke-test the built image
+        if: steps.exists.outputs.found == 'false'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8080:8000 -e "GIT_SHA=${TAG}" "$IMAGE"
+
+          # Always clean the container up, pass or fail.
+          cleanup() { docker rm -f smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          echo "Polling http://localhost:8080/health for up to 30 seconds..."
+          ok=false
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /tmp/health.json -w '%{http_code}' http://localhost:8080/health || true)"
+            if [ "$code" = "200" ]; then
+              echo "Healthy after ${i}s: $(cat /tmp/health.json)"
+              ok=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ok" != "true" ]; then
+            echo "::error::Smoke test failed - the container never returned HTTP 200 on /health within 30s. Nothing will be pushed to ECR."
+            echo "----- container logs -----"
+            docker logs smoke || true
+            exit 1
+          fi
+
+      - name: Push the image to ECR
+        if: steps.exists.outputs.found == 'false'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          set -euo pipefail
+          # We only ever get here if unit tests AND the smoke test passed.
+          docker push "$IMAGE"
+          echo "Pushed $IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # 3. DEPLOY - register a new task definition revision and point the service
+  #    at it, remembering the outgoing revision so rollback is one click.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ECS
+    needs: build
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    env:
+      # Everything account-specific comes from repository VARIABLES, never from
+      # hardcoded values in this file.
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      TASK_FAMILY: ${{ vars.TASK_FAMILY }}
+      CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+      SSM_PREVIOUS_PARAM: ${{ vars.SSM_PREVIOUS_PARAM }}
+      IMAGE: ${{ needs.build.outputs.image }}
+      IMAGE_TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # A task definition is a numbered, immutable snapshot: image + cpu + memory
+      # + env + logging. Registering one does NOT deploy anything by itself.
+      - name: Register a new task definition revision
+        id: register
+        run: |
+          set -euo pipefail
+          # Put the real image URI into the __IMAGE__ placeholder. jq is used
+          # (not sed) so we fail loudly if the JSON is malformed.
+          jq --arg image "$IMAGE" --arg name "$CONTAINER_NAME" \
+            '(.containerDefinitions[] | select(.name == $name) | .image) = $image' \
+            ecs/task-definition.json > /tmp/taskdef.json
+
+          if grep -q '__IMAGE__' /tmp/taskdef.json; then
+            echo "::error::Placeholder __IMAGE__ was not replaced. Does ecs/task-definition.json contain a container named '${CONTAINER_NAME}'?"
+            exit 1
+          fi
+
+          NEW_ARN="$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)"
+
+          # Turn the long ARN into the short, human-friendly "family:revision".
+          NEW_REV="${NEW_ARN##*/}"
+          echo "arn=${NEW_ARN}" >> "$GITHUB_OUTPUT"
+          echo "revision=${NEW_REV}" >> "$GITHUB_OUTPUT"
+          echo "Registered ${NEW_REV} with image ${IMAGE}"
+
+      # On a brand-new account the ECS service may not exist yet - you create it
+      # once, by hand, in the console. Registering the task definition is still
+      # useful (it gives the console something to pick), so we stop here with a
+      # warning instead of a red build.
+      - name: Check the ECS service exists
+        id: service
+        run: |
+          set -euo pipefail
+          STATUS="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].status' --output text 2>/dev/null || echo "MISSING")"
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Task definition ${{ steps.register.outputs.revision }} was registered, but ECS service '${ECS_SERVICE}' in cluster '${ECS_CLUSTER}' is not ACTIVE (status: ${STATUS}). Create the service once in the AWS console using this task definition - see the README section 'Create the ECS service'. Nothing was deployed."
+          else
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Service ${ECS_SERVICE} is ACTIVE."
+          fi
+
+      - name: Read the currently running task definition
+        id: current
+        if: steps.service.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          CUR_ARN="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          CUR_REV="${CUR_ARN##*/}"
+          echo "revision=${CUR_REV}" >> "$GITHUB_OUTPUT"
+          echo "Service is currently running ${CUR_REV}"
+
+          # Nothing to do if the service already runs exactly this revision.
+          if [ "${CUR_REV}" = "${{ steps.register.outputs.revision }}" ]; then
+            echo "same=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Service already runs ${CUR_REV}. Skipping update-service."
+          else
+            echo "same=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # THE ROLLBACK POINTER. Before we change anything, remember what was
+      # running. This is deliberately saved as "family:revision" - a pointer to
+      # an already-built, already-tested image - which is why rollback never
+      # needs to build anything.
+      - name: Save the outgoing revision as the rollback target
+        id: save
+        if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
+        run: |
+          set -euo pipefail
+          aws ssm put-parameter \
+            --name "$SSM_PREVIOUS_PARAM" \
+            --type String \
+            --value "${{ steps.current.outputs.revision }}" \
+            --overwrite >/dev/null
+          echo "Rollback target saved to ${SSM_PREVIOUS_PARAM}: ${{ steps.current.outputs.revision }}"
+
+      - name: Update the service to the new revision
+        if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.revision }}" \
+            >/dev/null
+          echo "Service update requested: ${{ steps.register.outputs.revision }}"
+
+      # A custom polling loop instead of `aws ecs wait services-stable`, because
+      # the built-in waiter times out at 10 minutes (too short for a blue/green
+      # bake time) and prints nothing while it waits. This prints progress.
+      - name: Wait for the rollout to finish
+        id: wait
+        if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
+        run: |
+          set -euo pipefail
+          TIMEOUT=1200            # 20 minutes - long enough for a blue/green bake
+          INTERVAL=15
+          DEADLINE=$(( $(date +%s) + TIMEOUT ))
+
+          while true; do
+            SVC="$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0]' --output json)"
+
+            STATE="$(echo "$SVC" | jq -r '[.deployments[] | select(.status=="PRIMARY") | .rolloutState // "IN_PROGRESS"][0] // "IN_PROGRESS"')"
+            COUNT="$(echo "$SVC" | jq -r '.deployments | length')"
+            TASKS="$(echo "$SVC" | jq -r '[.deployments[] | select(.status=="PRIMARY") | "\(.runningCount)/\(.desiredCount)"][0] // "?"')"
+            EVENT="$(echo "$SVC" | jq -r '.events[0].message // "(no events yet)"')"
+
+            echo "[$(date -u +%H:%M:%S)] rolloutState=${STATE} tasks=${TASKS} deployments=${COUNT} | ${EVENT}"
+
+            # Done: the new deployment completed AND the old one has drained away.
+            if [ "$STATE" = "COMPLETED" ] && [ "$COUNT" -eq 1 ]; then
+              echo "Rollout completed."
+              break
+            fi
+
+            # ECS itself declared the deployment failed (deployment circuit breaker).
+            if [ "$STATE" = "FAILED" ]; then
+              echo "::error::ECS reported rolloutState=FAILED."
+              break
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after ${TIMEOUT}s waiting for the rollout to stabilise."
+              exit 1
+            fi
+            sleep "$INTERVAL"
+          done
+
+      # Trust, but verify. If the circuit breaker rolled back, the service is now
+      # running the OLD revision - which is a *good* outcome for users but must
+      # be a red build for us.
+      - name: Verify the new revision is live
+        id: verify
+        if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
+        run: |
+          set -euo pipefail
+          LIVE_ARN="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          LIVE_REV="${LIVE_ARN##*/}"
+          echo "live=${LIVE_REV}" >> "$GITHUB_OUTPUT"
+
+          if [ "$LIVE_REV" != "${{ steps.register.outputs.revision }}" ]; then
+            echo "::error::Deployment failed health checks; ECS automatically rolled back to ${LIVE_REV}. Production kept serving the previous version."
+            exit 1
+          fi
+          echo "Verified: ${LIVE_REV} is live."
+
+      # The summary table is what you show your seniors - it is rendered on the
+      # run's page in GitHub. `always()` so it appears on failures too.
+      - name: Write the job summary
+        if: always()
+        run: |
+          {
+            echo "## Deploy"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo "| Image tag | \`${IMAGE_TAG:-n/a}\` |"
+            echo "| Image | \`${IMAGE:-n/a}\` |"
+            echo "| Image reused from ECR | ${{ needs.build.outputs.reused }} |"
+            echo "| New task definition | \`${{ steps.register.outputs.revision || 'not registered' }}\` |"
+            echo "| Previous revision (rollback target) | \`${{ steps.current.outputs.revision || 'none saved' }}\` |"
+            echo "| Saved to SSM | \`${SSM_PREVIOUS_PARAM}\` |"
+            echo "| Live revision after deploy | \`${{ steps.verify.outputs.live || 'n/a' }}\` |"
+            echo "| Result | **${{ job.status }}** |"
+            echo ""
+            echo "To undo this deploy: run the **Rollback** workflow with an empty revision input - it returns the service to the previous revision without building anything."
+          } >> "$GITHUB_STEP_SUMMARY"

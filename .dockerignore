@@ -1,0 +1,25 @@
+# Keep the build context small and the image clean.
+# Nothing here is needed to RUN the app — only to develop or deploy it.
+.git
+.gitignore
+.github
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+tests
+conftest.py
+requirements-dev.txt
+docs
+infra
+scripts
+ecs
+README.md
+*.md
+.env
+.idea
+.vscode

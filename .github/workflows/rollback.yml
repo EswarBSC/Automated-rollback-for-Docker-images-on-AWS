@@ -1,0 +1,282 @@
+# =============================================================================
+# Rollback - put a previously tested version back in production, fast.
+#
+# THIS WORKFLOW NEVER BUILDS ANYTHING. There is no docker build, no docker push
+# and no ECR write anywhere in it. All it does is point the ECS service at a
+# task definition revision that already exists - one that was built, unit
+# tested, smoke tested and run in production earlier. That is what makes a
+# rollback take seconds instead of a full CI cycle, and it is why a rollback
+# cannot introduce a new, untested artefact.
+#
+# Two different situations are handled:
+#   A. A deployment is still IN PROGRESS  -> ask ECS to stop and roll it back.
+#   B. A bad deployment already finished  -> point the service at the previous
+#                                            revision (from the SSM parameter,
+#                                            or one you type in).
+# =============================================================================
+name: Rollback
+
+on:
+  workflow_dispatch:        # manual only - production rollbacks are a human decision
+    inputs:
+      revision:
+        description: 'Task definition to roll back to. Accepts "rollback-demo-task:5" or just "5". Leave EMPTY to use the previous revision saved in SSM.'
+        required: false
+        default: ''
+        type: string
+      reason:
+        description: 'Why are you rolling back? (shown in the run summary / audit trail)'
+        required: false
+        default: 'Not specified'
+        type: string
+
+permissions:
+  contents: read
+  id-token: write           # OIDC again - no AWS keys in this repo
+
+concurrency:
+  # Deliberately a DIFFERENT group from the deploy workflow. If they shared a
+  # group, an emergency rollback would sit in a queue behind the very deploy it
+  # is trying to undo.
+  group: rollback-prod
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Roll back ECS service
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    env:
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      TASK_FAMILY: ${{ vars.TASK_FAMILY }}
+      SSM_PREVIOUS_PARAM: ${{ vars.SSM_PREVIOUS_PARAM }}
+      INPUT_REVISION: ${{ inputs.revision }}
+      REASON: ${{ inputs.reason }}
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Record the start time
+        id: clock
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # ---- Step 1: what is running right now? -------------------------------
+      - name: Read the current task definition
+        id: current
+        run: |
+          set -euo pipefail
+          CUR_ARN="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          CUR_REV="${CUR_ARN##*/}"
+
+          # The image tag is the proof of which build is live.
+          CUR_IMAGE="$(aws ecs describe-task-definition --task-definition "$CUR_REV" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+
+          echo "revision=${CUR_REV}" >> "$GITHUB_OUTPUT"
+          echo "image=${CUR_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Currently live: ${CUR_REV}  (${CUR_IMAGE})"
+
+      # ---- Step 2: is a deployment still in flight? -------------------------
+      # If ECS is mid-rollout, the cleanest undo is to tell ECS itself to stop
+      # and reverse it. That is faster than racing it with an update-service.
+      - name: Look for an in-flight deployment
+        id: inflight
+        run: |
+          set -euo pipefail
+          ARN="$(aws ecs list-service-deployments \
+            --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --status IN_PROGRESS PENDING \
+            --query 'serviceDeployments[0].serviceDeploymentArn' \
+            --output text 2>/dev/null || echo "None")"
+
+          if [ -z "$ARN" ] || [ "$ARN" = "None" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No deployment in progress - will roll back by switching revisions."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "arn=${ARN}" >> "$GITHUB_OUTPUT"
+            echo "Found an in-flight deployment: ${ARN}"
+          fi
+
+      - name: Stop and reverse the in-flight deployment
+        id: stop
+        if: steps.inflight.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          # --stop-type ROLLBACK tells ECS to abandon the new version and bring
+          # the previous service revision back. No new image is involved.
+          aws ecs stop-service-deployment \
+            --service-deployment-arn "${{ steps.inflight.outputs.arn }}" \
+            --stop-type ROLLBACK >/dev/null
+          echo "Asked ECS to stop and roll back the deployment."
+
+          TIMEOUT=1200
+          INTERVAL=15
+          DEADLINE=$(( $(date +%s) + TIMEOUT ))
+          while true; do
+            SVC="$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0]' --output json)"
+            STATE="$(echo "$SVC" | jq -r '[.deployments[] | select(.status=="PRIMARY") | .rolloutState // "IN_PROGRESS"][0] // "IN_PROGRESS"')"
+            COUNT="$(echo "$SVC" | jq -r '.deployments | length')"
+            EVENT="$(echo "$SVC" | jq -r '.events[0].message // "(no events yet)"')"
+            echo "[$(date -u +%H:%M:%S)] rolloutState=${STATE} deployments=${COUNT} | ${EVENT}"
+
+            if [ "$COUNT" -eq 1 ] && { [ "$STATE" = "COMPLETED" ] || [ "$STATE" = "FAILED" ]; }; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out waiting for the stopped deployment to settle."
+              exit 1
+            fi
+            sleep "$INTERVAL"
+          done
+
+          LIVE_ARN="$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          LIVE_REV="${LIVE_ARN##*/}"
+          LIVE_IMAGE="$(aws ecs describe-task-definition --task-definition "$LIVE_REV" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+          echo "revision=${LIVE_REV}" >> "$GITHUB_OUTPUT"
+          echo "image=${LIVE_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "::notice::In-flight deployment rolled back. Service is running ${LIVE_REV}."
+
+      # ---- Step 3: work out which revision to return to ---------------------
+      - name: Resolve the rollback target
+        id: target
+        if: steps.inflight.outputs.found == 'false'
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_REVISION}" ]; then
+            # Accept "rollback-demo-task:5" or a bare "5".
+            case "${INPUT_REVISION}" in
+              *:*) TARGET="${INPUT_REVISION}" ;;
+              *)   TARGET="${TASK_FAMILY}:${INPUT_REVISION}" ;;
+            esac
+            echo "Target from workflow input: ${TARGET}"
+          else
+            # No input: use the revision the last deploy saved before switching.
+            TARGET="$(aws ssm get-parameter --name "$SSM_PREVIOUS_PARAM" \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo "")"
+            if [ -z "$TARGET" ] || [ "$TARGET" = "None" ]; then
+              echo "::error::No revision was given and the SSM parameter ${SSM_PREVIOUS_PARAM} is empty or missing. Run a deploy first, or pass a revision number to this workflow."
+              exit 1
+            fi
+            echo "Target from SSM (${SSM_PREVIOUS_PARAM}): ${TARGET}"
+          fi
+
+          # Confirm the revision really exists before touching the service.
+          if ! aws ecs describe-task-definition --task-definition "$TARGET" >/dev/null 2>&1; then
+            echo "::error::Task definition ${TARGET} does not exist. Check the Task Definitions page in the ECS console for a valid revision number."
+            exit 1
+          fi
+
+          TARGET_IMAGE="$(aws ecs describe-task-definition --task-definition "$TARGET" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+          echo "revision=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "image=${TARGET_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Rollback target image: ${TARGET_IMAGE}  (already in ECR - nothing to build)"
+
+          # Running the rollback twice must be harmless.
+          if [ "$TARGET" = "${{ steps.current.outputs.revision }}" ]; then
+            echo "noop=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already running the rollback target - nothing to do."
+          else
+            echo "noop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- Step 4: switch the service over ----------------------------------
+      - name: Point the service at the rollback target
+        if: steps.inflight.outputs.found == 'false' && steps.target.outputs.noop == 'false'
+        run: |
+          set -euo pipefail
+          # This is the entire rollback: one API call, pointing at an existing
+          # revision. No build, no push, no new artefact.
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.target.outputs.revision }}" >/dev/null
+          echo "Rollback requested: ${{ steps.current.outputs.revision }} -> ${{ steps.target.outputs.revision }}"
+
+      - name: Wait for the rollback to finish
+        if: steps.inflight.outputs.found == 'false' && steps.target.outputs.noop == 'false'
+        run: |
+          set -euo pipefail
+          TIMEOUT=1200            # same 20-minute budget as deploy
+          INTERVAL=15
+          DEADLINE=$(( $(date +%s) + TIMEOUT ))
+
+          while true; do
+            SVC="$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0]' --output json)"
+
+            STATE="$(echo "$SVC" | jq -r '[.deployments[] | select(.status=="PRIMARY") | .rolloutState // "IN_PROGRESS"][0] // "IN_PROGRESS"')"
+            COUNT="$(echo "$SVC" | jq -r '.deployments | length')"
+            TASKS="$(echo "$SVC" | jq -r '[.deployments[] | select(.status=="PRIMARY") | "\(.runningCount)/\(.desiredCount)"][0] // "?"')"
+            EVENT="$(echo "$SVC" | jq -r '.events[0].message // "(no events yet)"')"
+
+            echo "[$(date -u +%H:%M:%S)] rolloutState=${STATE} tasks=${TASKS} deployments=${COUNT} | ${EVENT}"
+
+            if [ "$STATE" = "COMPLETED" ] && [ "$COUNT" -eq 1 ]; then
+              echo "Rollback completed."
+              break
+            fi
+            if [ "$STATE" = "FAILED" ]; then
+              echo "::error::ECS reported rolloutState=FAILED while rolling back. The target revision itself may be unhealthy - pick an older revision."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after ${TIMEOUT}s waiting for the rollback to stabilise."
+              exit 1
+            fi
+            sleep "$INTERVAL"
+          done
+
+      - name: Verify the rollback target is live
+        id: verify
+        if: steps.inflight.outputs.found == 'false' && steps.target.outputs.noop == 'false'
+        run: |
+          set -euo pipefail
+          LIVE_ARN="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          LIVE_REV="${LIVE_ARN##*/}"
+          echo "live=${LIVE_REV}" >> "$GITHUB_OUTPUT"
+
+          if [ "$LIVE_REV" != "${{ steps.target.outputs.revision }}" ]; then
+            echo "::error::Expected ${{ steps.target.outputs.revision }} to be live but the service is running ${LIVE_REV}."
+            exit 1
+          fi
+          echo "Verified: ${LIVE_REV} is live."
+
+      # NOTE: the SSM parameter is deliberately NOT updated here. It keeps
+      # pointing at the last known-good revision recorded by the deploy
+      # workflow, which means running this rollback twice is safe and idempotent.
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          DURATION=$(( $(date +%s) - ${{ steps.clock.outputs.start }} ))
+          {
+            echo "## Rollback"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Triggered by | @${GITHUB_ACTOR} |"
+            echo "| Reason | ${REASON} |"
+            echo "| Mode | ${{ steps.inflight.outputs.found == 'true' && 'Stopped an in-flight deployment (ECS ROLLBACK)' || 'Switched to an existing revision' }} |"
+            echo "| From revision | \`${{ steps.current.outputs.revision || 'unknown' }}\` |"
+            echo "| From image | \`${{ steps.current.outputs.image || 'unknown' }}\` |"
+            echo "| To revision | \`${{ steps.stop.outputs.revision || steps.target.outputs.revision || 'unchanged' }}\` |"
+            echo "| To image | \`${{ steps.stop.outputs.image || steps.target.outputs.image || 'unchanged' }}\` |"
+            echo "| Duration | ${DURATION}s |"
+            echo "| Result | **${{ job.status }}** |"
+            echo ""
+            echo "**No image was built during this rollback.** The service was pointed at a task definition revision that already existed, running an image that was already in ECR and had already passed unit tests, the smoke test and a production rollout."
+          } >> "$GITHUB_STEP_SUMMARY"
