@@ -21,8 +21,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # BANNER_MESSAGE is the text inside that box.
 # Change them, commit, push -> a new image is built and deployed. The previous
 # image stays in ECR untouched, which is what makes rollback instant.
-APP_COLOR = "#2563eb"           # blue  -> "v1" look. Try "#dc2626" (red) for v2.
-BANNER_MESSAGE = "v1 — stable release"
+APP_COLOR = "#dc2626"                    # red
+BANNER_MESSAGE = "v2 — BROKEN RELEASE"
+
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="ECS Rollback Demo")
