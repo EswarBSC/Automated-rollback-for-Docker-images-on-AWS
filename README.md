@@ -232,9 +232,20 @@ docs/DEMO.md                Step-by-step demo script for presenting this
 add the variable when you are ready.
 
 **`Error: Could not assume role with OIDC` / `Not authorized to perform sts:AssumeRoleWithWebIdentity`.**
-The role's trust policy does not match this repository. Check the `sub`
-condition is `repo:EswarBSC/Automated-rollback-for-Docker-images-on-AWS:*` and
-that the workflow has `permissions: id-token: write`.
+The role's trust policy does not match the `sub` claim GitHub is sending. AWS
+returns this same message whether the identity provider is missing, the role is
+missing, or the condition does not match — it will not tell you which.
+
+The catch in this organization: GitHub's **unique token claims** setting is on,
+so the `sub` carries immutable numeric IDs and looks like
+`repo:EswarBSC@296782642/Automated-rollback-for-Docker-images-on-AWS@1381449371:ref:refs/heads/main`,
+**not** the `repo:OWNER/REPO:*` form every online guide shows. The trust policy
+must match the long form — see
+[`infra/README.md`](infra/README.md) step 6. Also confirm the workflow has
+`permissions: id-token: write`.
+
+To see the real claims instead of guessing, run the `Debug OIDC` workflow; it
+prints the literal `iss`, `aud` and `sub` without exposing the token.
 
 **`denied: User ... is not authorized to perform: ecr:InitiateLayerUpload`.**
 The ECR repository name or region does not match the policy ARN in

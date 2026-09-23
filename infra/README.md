@@ -115,7 +115,7 @@ this folder):
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:EswarBSC/Automated-rollback-for-Docker-images-on-AWS:*"
+          "token.actions.githubusercontent.com:sub": "repo:EswarBSC@296782642/Automated-rollback-for-Docker-images-on-AWS@1381449371:*"
         }
       }
     }
@@ -130,6 +130,33 @@ this folder):
 The `sub` condition is the security boundary: only workflows in
 **your** repository can assume this role. Without it, any GitHub repository in
 the world could.
+
+#### Why those `@` numbers are in the `sub` — read this before you copy a guide
+
+Almost every tutorial online shows the `sub` as:
+
+```
+repo:OWNER/REPOSITORY:*
+```
+
+That form **does not work in the EswarBSC organization**, and produces a
+baffling `Not authorized to perform sts:AssumeRoleWithWebIdentity` with a trust
+policy that looks perfect. The organization has GitHub's **unique token claims**
+(immutable IDs) setting enabled, so the token GitHub actually sends looks like:
+
+```
+repo:EswarBSC@296782642/Automated-rollback-for-Docker-images-on-AWS@1381449371:ref:refs/heads/main
+```
+
+`296782642` is the owner ID and `1381449371` is the repository ID. They never
+change, even if the org or the repository is renamed — and, crucially, a
+*deleted and recreated* repository of the same name gets a **different** ID. So
+this form is strictly more secure than the name-based one: nobody can take over
+your AWS role by grabbing your repository name after you delete it.
+
+**If you fork this project into a different repo or org**, these numbers will be
+wrong. Do not guess them — run the `Debug OIDC` workflow (in
+`.github/workflows/`, delete it afterwards) and copy the `sub` it prints.
 
 > Tightening it further: replace `:*` with
 > `:ref:refs/heads/main` to allow only the main branch. Be aware that this also
