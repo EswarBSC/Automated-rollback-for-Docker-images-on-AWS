@@ -159,6 +159,8 @@ hardcoded in any workflow file.
 | `TASK_FAMILY` | `rollback-demo-task` | Used to expand a bare revision number like `5` |
 | `CONTAINER_NAME` | `app` | Which container in the task definition gets the new image |
 | `SSM_PREVIOUS_PARAM` | `/rollback-demo/prod/previous-taskdef` | Stores the rollback target |
+| `LOG_GROUP` | `/ecs/rollback-demo` | Optional. Log group the *Version logs* workflow queries |
+| `APP_URL` | the ALB URL | Optional. Lets *What is live?* ask the app directly, and adds a clickable link to deployment records |
 
 ---
 
@@ -231,8 +233,11 @@ ecs/task-definition.json    ECS/EC2 task definition template ("__IMAGE__" placeh
 infra/                      IAM policies + console set-up instructions
 scripts/rollback.sh         Terminal rollback, same logic as the workflow
 docs/DEMO.md                Step-by-step demo script for presenting this
+app/logging_config.py       Structured JSON logging; every line carries the version
 .github/workflows/deploy.yml    test → build → deploy
 .github/workflows/rollback.yml  manual rollback, contains no build step
+.github/workflows/status.yml    "What is live?" - live version + drift vs GitHub
+.github/workflows/logs.yml      "Version logs" - one release's logs in the Actions tab
 ```
 
 ---

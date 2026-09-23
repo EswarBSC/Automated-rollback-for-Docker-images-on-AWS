@@ -1,0 +1,212 @@
+# =============================================================================
+# What is live? - answer "which version is in production" from GitHub alone.
+#
+# There are two different answers to that question and they can disagree:
+#
+#   * what GitHub THINKS is live - the Deployments API, shown in the
+#     "Environments" panel on the repository home page. Written by the Deploy
+#     and Rollback workflows.
+#   * what AWS is ACTUALLY running - queried live from ECS by this workflow.
+#
+# They drift apart whenever something changes production without going through
+# a workflow: an ECS circuit-breaker auto-rollback, a console edit, someone
+# running scripts/rollback.sh from a terminal. This workflow reports both and
+# tells you when they disagree, which makes it the source of truth.
+#
+# It is read-only. It changes nothing in AWS.
+# =============================================================================
+name: What is live?
+
+on:
+  workflow_dispatch:
+  # Uncomment to get an hourly drift check. Useful once this is a real service;
+  # noisy for a demo repository.
+  # schedule:
+  #   - cron: '0 * * * *'
+
+permissions:
+  contents: read
+  id-token: write        # OIDC
+  deployments: read      # to compare against what GitHub believes
+
+jobs:
+  status:
+    name: Report the live version
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    env:
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      SSM_PREVIOUS_PARAM: ${{ vars.SSM_PREVIOUS_PARAM }}
+      LOG_GROUP: ${{ vars.LOG_GROUP }}
+      APP_URL: ${{ vars.APP_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ---- What is ECS actually running right now? --------------------------
+      - name: Query ECS
+        id: ecs
+        run: |
+          set -euo pipefail
+          SVC="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0]' --output json)"
+
+          LIVE_ARN="$(echo "$SVC" | jq -r '.taskDefinition')"
+          LIVE_REV="${LIVE_ARN##*/}"
+          RUNNING="$(echo "$SVC" | jq -r '.runningCount')"
+          DESIRED="$(echo "$SVC" | jq -r '.desiredCount')"
+          STATE="$(echo "$SVC" | jq -r '[.deployments[] | select(.status=="PRIMARY") | .rolloutState // "IN_PROGRESS"][0] // "UNKNOWN"')"
+          DEPLOYMENTS="$(echo "$SVC" | jq -r '.deployments | length')"
+
+          TD="$(aws ecs describe-task-definition --task-definition "$LIVE_REV" --output json)"
+          IMAGE="$(echo "$TD" | jq -r '.taskDefinition.containerDefinitions[0].image')"
+          REGISTERED="$(echo "$TD" | jq -r '.taskDefinition.registeredAt // "unknown"')"
+          # The image tag IS the 7-char git SHA - that is what makes this mapping
+          # possible without any extra bookkeeping.
+          TAG="${IMAGE##*:}"
+
+          {
+            echo "revision=${LIVE_REV}"
+            echo "image=${IMAGE}"
+            echo "tag=${TAG}"
+            echo "registered=${REGISTERED}"
+            echo "running=${RUNNING}"
+            echo "desired=${DESIRED}"
+            echo "state=${STATE}"
+            echo "deployments=${DEPLOYMENTS}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Live: ${LIVE_REV} running ${TAG} (${RUNNING}/${DESIRED} tasks, ${STATE})"
+
+      - name: Read the saved rollback target
+        id: ssm
+        run: |
+          set -euo pipefail
+          TARGET="$(aws ssm get-parameter --name "$SSM_PREVIOUS_PARAM" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "none")"
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+
+      # ---- Which commit is that? --------------------------------------------
+      - name: Resolve the image tag to a commit
+        id: commit
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ecs.outputs.tag }}"
+
+          # A tag that is not a commit (e.g. someone deployed by hand) must not
+          # fail this workflow - report it and move on.
+          if COMMIT_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" 2>/dev/null)"; then
+            {
+              echo "sha=$(echo "$COMMIT_JSON"     | jq -r '.sha')"
+              echo "subject=$(echo "$COMMIT_JSON" | jq -r '.commit.message' | head -1)"
+              echo "author=$(echo "$COMMIT_JSON"  | jq -r '.commit.author.name')"
+              echo "date=$(echo "$COMMIT_JSON"    | jq -r '.commit.author.date')"
+              echo "found=true"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Image tag ${TAG} does not match any commit in this repository."
+          fi
+
+      # ---- What does GitHub believe? ----------------------------------------
+      - name: Compare with the latest GitHub deployment
+        id: drift
+        run: |
+          set -euo pipefail
+          GH_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/deployments?environment=production&per_page=1" \
+            --jq '.[0].sha // ""' 2>/dev/null || echo "")"
+          LIVE_SHA="${{ steps.commit.outputs.sha }}"
+
+          echo "github_sha=${GH_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$GH_SHA" ]; then
+            echo "drift=unknown" >> "$GITHUB_OUTPUT"
+          elif [ "$GH_SHA" = "$LIVE_SHA" ]; then
+            echo "drift=none" >> "$GITHUB_OUTPUT"
+            echo "GitHub and AWS agree."
+          else
+            echo "drift=yes" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub's last recorded production deployment is ${GH_SHA:0:7} but AWS is running ${LIVE_SHA:0:7}. Something changed production outside a workflow - most likely an ECS circuit-breaker auto-rollback."
+          fi
+
+      # ---- Ask the application itself ---------------------------------------
+      # The most direct evidence available: the running container reports its
+      # own version, both in /version and in the X-App-Version response header.
+      - name: Ask the running application
+        id: app
+        if: vars.APP_URL != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BODY="$(curl -fsS --max-time 10 "${APP_URL%/}/version" || echo '{}')"
+          HEADER="$(curl -fsS --max-time 10 -o /dev/null -D - "${APP_URL%/}/health" \
+                    | tr -d '\r' | awk -F': ' 'tolower($1)=="x-app-version"{print $2}')"
+          echo "version=$(echo "$BODY" | jq -r '.version // "unknown"')" >> "$GITHUB_OUTPUT"
+          echo "header=${HEADER:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the summary
+        if: always()
+        run: |
+          {
+            echo "## Production status"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Live version** | \`${{ steps.ecs.outputs.tag }}\` |"
+            echo "| Task definition | \`${{ steps.ecs.outputs.revision }}\` |"
+            echo "| Image | \`${{ steps.ecs.outputs.image }}\` |"
+            echo "| Registered at | ${{ steps.ecs.outputs.registered }} |"
+            echo "| Tasks | ${{ steps.ecs.outputs.running }} / ${{ steps.ecs.outputs.desired }} running |"
+            echo "| Rollout state | ${{ steps.ecs.outputs.state }} (${{ steps.ecs.outputs.deployments }} deployment/s) |"
+            echo "| Rollback target in SSM | \`${{ steps.ssm.outputs.target }}\` |"
+            echo ""
+
+            if [ "${{ steps.commit.outputs.found }}" = "true" ]; then
+              echo "### Commit in production"
+              echo ""
+              echo "[\`${{ steps.ecs.outputs.tag }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.commit.outputs.sha }}) — ${{ steps.commit.outputs.subject }}"
+              echo ""
+              echo "by ${{ steps.commit.outputs.author }} on ${{ steps.commit.outputs.date }}"
+              echo ""
+            fi
+
+            case "${{ steps.drift.outputs.drift }}" in
+              none)
+                echo "✅ **In sync** — GitHub's deployment record matches what AWS is running." ;;
+              yes)
+                echo "⚠️ **Drift detected** — GitHub last recorded \`${{ steps.drift.outputs.github_sha }}\` as deployed, but AWS is running \`${{ steps.ecs.outputs.tag }}\`."
+                echo ""
+                echo "Production changed outside a workflow. The usual cause is an ECS deployment circuit-breaker rollback, or \`scripts/rollback.sh\` run from a terminal." ;;
+              *)
+                echo "ℹ️ No GitHub deployment record yet for the \`production\` environment." ;;
+            esac
+            echo ""
+
+            if [ -n "${APP_URL}" ]; then
+              echo "### Reported by the application itself"
+              echo ""
+              echo "| Source | Value |"
+              echo "|---|---|"
+              echo "| \`GET /version\` | \`${{ steps.app.outputs.version || 'unreachable' }}\` |"
+              echo "| \`X-App-Version\` header | \`${{ steps.app.outputs.header || 'unreachable' }}\` |"
+              echo ""
+            fi
+
+            echo "### Logs for this version"
+            echo ""
+            echo "Every log stream for this release is named \`${{ steps.ecs.outputs.tag }}/app/<task-id>\`."
+            echo "Filter by that prefix in the log group, or run the **Version logs** workflow."
+            echo ""
+            echo '```'
+            echo 'fields @timestamp, level, message, path, status, duration_ms'
+            echo '| filter version = "${{ steps.ecs.outputs.tag }}"'
+            echo '| sort @timestamp desc'
+            echo '| limit 100'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

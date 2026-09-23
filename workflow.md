@@ -676,6 +676,167 @@ BANNER_MESSAGE = "v1 — stable release"
 
 ---
 
+## 12. Per-version logs, and knowing what is live
+
+Two operational gaps found in review, and how they are closed.
+
+### 12.1 The problem with the original logging
+
+All versions wrote to one log group with the stream prefix `app`, so streams
+were named `app/app/<task-id>`. Nothing identified the release. To read "the
+logs for v2" you had to know which task IDs happened to be running at the time —
+and after a rollback those tasks were gone.
+
+Logs were also plain text, so nothing could be filtered or aggregated. You could
+grep for a substring; you could not ask "what was the error rate of the release
+we just rolled back?"
+
+### 12.2 The fix: one log group, two ways to slice it
+
+**Do not** create a log group per version. It looks tidy and is a trap: log
+group sprawl, retention and metric filters to maintain per release, and — worst
+— comparing two releases becomes impossible, which is the single most useful
+query during an incident.
+
+Instead the version is attached to the data in two places.
+
+**a) Structured JSON logs** (`app/logging_config.py`)
+
+Every line is one JSON object carrying `version`, `env`, `host`, plus the
+request fields:
+
+```json
+{"timestamp":"2026-09-23T11:43:48.226Z","level":"INFO","logger":"app",
+ "message":"request","version":"9d6a814","env":"prod","host":"c491314d996b",
+ "request_id":"0eed6985d58041eb","method":"GET","path":"/health",
+ "status":200,"duration_ms":1.25,"client":"10.0.1.23"}
+```
+
+CloudWatch Logs Insights discovers JSON fields automatically, so
+`filter version = "9d6a814"` works with no configuration. uvicorn's own loggers
+are re-pointed at the same formatter, so *every* line is JSON — one badly
+formatted line would break the parse for the whole query.
+
+Log levels are meaningful: 5xx → `ERROR`, 4xx → `WARNING`, else `INFO`. That
+makes `filter level = "ERROR"` a real signal rather than noise.
+
+Implemented in ~40 lines of stdlib — no extra dependency to keep patched.
+
+**b) Per-version log stream names**
+
+`ecs/task-definition.json` now has `"awslogs-stream-prefix": "__VERSION__"`,
+which the Deploy workflow replaces with the image tag, exactly as it does for
+`__IMAGE__`. ECS names each stream `<prefix>/<container>/<task-id>`, so streams
+become:
+
+```
+9d6a814/app/3f2b1c…      ← release 9d6a814
+89f0544/app/7a9e4d…      ← release 89f0544
+```
+
+Filtering streams by prefix in the console needs no query language at all —
+which matters when someone who does not know Logs Insights has to look.
+
+**Useful queries**
+
+```
+# everything from one release
+fields @timestamp, level, message, method, path, status, duration_ms
+| filter version = "9d6a814"
+| sort @timestamp desc | limit 100
+
+# errors only, across all releases
+fields @timestamp, version, path, status, message
+| filter level = "ERROR"
+| sort @timestamp desc
+
+# compare releases - the query that justifies a single log group
+stats count(*) as requests,
+      sum(status >= 500) as errors,
+      avg(duration_ms) as avg_ms,
+      pct(duration_ms, 95) as p95_ms
+  by version
+```
+
+**c) `X-App-Version` response header**
+
+Every response carries `X-App-Version` and `X-Request-Id`. `curl -I` against the
+ALB tells you the live build with no AWS access at all, and the request id ties
+a user's complaint to exact log lines.
+
+### 12.3 Knowing which version is live, from GitHub
+
+Three layers, because they fail in different ways.
+
+**a) GitHub Deployments API → the Environments panel**
+
+Both workflows write to the Deployments API, so the repository home page shows a
+**production** environment with the live commit, linked, with history.
+
+The important design decision: we call the API **explicitly** rather than using
+the `environment:` key on the job. The job key always attributes the deployment
+to the SHA the workflow ran on. That is right for a deploy and **wrong for a
+rollback**, where the commit going live is an older one. The Rollback workflow
+therefore resolves the rolled-back image's tag back to its commit
+(`gh api repos/.../commits/<tag>`) and registers *that* SHA. Without this, the
+Environments panel would confidently show the wrong commit after every rollback.
+
+Both are wrapped in `continue-on-error: true` — bookkeeping must never fail a
+deployment or, worse, a rollback.
+
+**b) `What is live?` workflow (`status.yml`) → the source of truth**
+
+Queries ECS directly and reports: live revision, image tag, registered-at, task
+counts, rollout state, the SSM rollback target, and the commit that image tag
+maps to (subject, author, date).
+
+It also **compares AWS against GitHub's deployment record and flags drift.**
+That matters because production can change without a workflow:
+
+- an ECS circuit-breaker auto-rollback
+- `scripts/rollback.sh` run from a terminal
+- a console edit
+
+In all three cases GitHub's record goes stale. This workflow is what catches it.
+
+If `vars.APP_URL` is set it also asks the running application itself, via
+`/version` and the `X-App-Version` header — the most direct evidence there is.
+
+**c) `Version logs` workflow (`logs.yml`) → logs without console access**
+
+Takes a version (or defaults to whatever is live), a time window, a level filter
+and a limit; runs the Logs Insights query and renders the results as a table in
+the job summary. Closes the loop: *which version is live* and *what did it log*
+are both answerable from the Actions tab alone.
+
+### 12.4 What you must do in AWS for this
+
+**One IAM policy update.** `infra/github-actions-policy.json` gained two
+statements for the `Version logs` workflow:
+
+| Sid | Actions | Resource |
+|---|---|---|
+| `LogsInsightsQueryThisLogGroupOnly` | `logs:StartQuery`, `StopQuery`, `DescribeLogStreams`, `GetLogEvents`, `FilterLogEvents` | the `/ecs/rollback-demo` log group ARN |
+| `LogsInsightsReadResults` | `logs:GetQueryResults` | `*` — AWS does not support resource-level permissions for this action |
+
+Apply it: IAM → Policies → `github-actions-rollback-demo-policy` → **Edit** →
+paste the updated file → Save. Until you do, only the `Version logs` workflow is
+affected; everything else keeps working.
+
+**Two new repository variables**, both optional:
+
+| Variable | Value | Effect if unset |
+|---|---|---|
+| `LOG_GROUP` | `/ecs/rollback-demo` | Falls back to that exact default |
+| `APP_URL` | the ALB URL, e.g. `http://rollback-demo-alb-1358437757.eu-north-1.elb.amazonaws.com` | `status.yml` skips the "ask the app" section; deployment records carry no clickable environment link |
+
+**Note on existing logs.** The per-version stream naming applies from the next
+deploy onward. Streams already written keep the old `app/app/<task-id>` names —
+CloudWatch cannot rename them. The `version` field is likewise only on lines
+written by an image built after this change.
+
+---
+
 ## Appendix A — Local development
 
 ```bash

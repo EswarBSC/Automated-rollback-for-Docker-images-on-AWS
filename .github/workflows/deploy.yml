@@ -297,6 +297,35 @@ jobs:
             --overwrite >/dev/null
           echo "Rollback target saved to ${SSM_PREVIOUS_PARAM}: ${{ steps.current.outputs.revision }}"
 
+      # Tell GitHub a deployment is starting. This is what populates the
+      # "Environments" panel on the repository home page, so anyone can see
+      # which commit is in production without AWS console access.
+      #
+      # We use the Deployments API explicitly rather than the `environment:` job
+      # key, because the job key always attributes the deployment to the SHA the
+      # workflow ran on. That is correct here, but WRONG for a rollback, where
+      # the commit going live is an older one. Using the API keeps both
+      # workflows able to record the truth.
+      - name: Open a GitHub deployment
+        id: ghdeploy
+        if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
+        continue-on-error: true      # never fail a deploy over bookkeeping
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ID="$(jq -n \
+                --arg ref "$GITHUB_SHA" \
+                --arg desc "Deploy ${IMAGE_TAG} as ${{ steps.register.outputs.revision }}" \
+                '{ref:$ref, environment:"production", description:$desc,
+                  auto_merge:false, required_contexts:[], production_environment:true}' \
+              | gh api "repos/${GITHUB_REPOSITORY}/deployments" --method POST --input - --jq '.id')"
+          echo "id=${ID}" >> "$GITHUB_OUTPUT"
+
+          jq -n --arg log "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+             '{state:"in_progress", description:"Rolling out to ECS", log_url:$log}' \
+            | gh api "repos/${GITHUB_REPOSITORY}/deployments/${ID}/statuses" --method POST --input - >/dev/null
+
       - name: Update the service to the new revision
         if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
         run: |
@@ -371,6 +400,33 @@ jobs:
           fi
           echo "Verified: ${LIVE_REV} is live."
 
+      # Close the deployment record. A "success" here is what makes the commit
+      # show as live in the Environments panel; a "failure" keeps the previous
+      # deployment marked as current, which is correct - if ECS rolled us back,
+      # the older commit really is still the live one.
+      - name: Close the GitHub deployment
+        if: always() && steps.ghdeploy.outputs.id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.verify.outcome }}" = "success" ]; then
+            STATE="success"
+            DESC="Live: ${{ steps.register.outputs.revision }} (${IMAGE_TAG})"
+          else
+            STATE="failure"
+            DESC="Deployment failed; production kept the previous version"
+          fi
+
+          jq -n --arg state "$STATE" --arg desc "$DESC" --arg url "${APP_URL:-}" \
+             --arg log "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+             '{state:$state, description:$desc, log_url:$log}
+              + (if $url == "" then {} else {environment_url:$url} end)' \
+            | gh api "repos/${GITHUB_REPOSITORY}/deployments/${{ steps.ghdeploy.outputs.id }}/statuses" \
+                --method POST --input - >/dev/null
+
       # The summary table is what you show your seniors - it is rendered on the
       # run's page in GitHub. `always()` so it appears on failures too.
       - name: Write the job summary
@@ -389,7 +445,19 @@ jobs:
             echo "| Previous revision (rollback target) | \`${{ steps.current.outputs.revision || 'none saved' }}\` |"
             echo "| Saved to SSM | \`${SSM_PREVIOUS_PARAM}\` |"
             echo "| Live revision after deploy | \`${{ steps.verify.outputs.live || 'n/a' }}\` |"
+            echo "| Log stream prefix | \`${IMAGE_TAG:-n/a}/app/\` |"
             echo "| Result | **${{ job.status }}** |"
+            echo ""
+            echo "### Logs for this version"
+            echo ""
+            echo "Every log stream from this release is named \`${IMAGE_TAG:-n/a}/app/<task-id>\`, and every log line carries \`version: ${IMAGE_TAG:-n/a}\`."
+            echo "Run the **Version logs** workflow, or paste this into CloudWatch Logs Insights:"
+            echo ""
+            echo '```'
+            echo "fields @timestamp, level, message, method, path, status, duration_ms"
+            echo "| filter version = \"${IMAGE_TAG:-n/a}\""
+            echo "| sort @timestamp desc | limit 100"
+            echo '```'
             echo ""
             echo "To undo this deploy: run the **Rollback** workflow with an empty revision input - it returns the service to the previous revision without building anything."
           } >> "$GITHUB_STEP_SUMMARY"

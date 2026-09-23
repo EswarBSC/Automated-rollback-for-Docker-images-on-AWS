@@ -6,9 +6,13 @@ pushed. If any of them fail, no image reaches ECR and nothing reaches ECS — th
 is principle #2, "only tested images ship".
 """
 
+import json
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app.logging_config import JsonFormatter
 from app.main import APP_COLOR, BANNER_MESSAGE, app
 
 client = TestClient(app)
@@ -85,3 +89,66 @@ def test_version_endpoint_reports_build_metadata(monkeypatch):
         "color": APP_COLOR,
         "message": BANNER_MESSAGE,
     }
+
+
+# ---------------------------------------------------------------------------
+# Structured logging and version traceability
+# ---------------------------------------------------------------------------
+# These matter operationally, not just cosmetically: per-version log filtering
+# in CloudWatch Logs Insights depends on every line being valid JSON carrying a
+# `version` field. If that contract breaks, the Version logs workflow silently
+# returns nothing, so it is worth a test.
+
+
+def test_json_formatter_emits_one_line_of_json_with_the_version(monkeypatch):
+    """Every log record must be a single valid JSON object tagged with the build."""
+    monkeypatch.setenv("GIT_SHA", "abc1234")
+    monkeypatch.setenv("APP_ENV", "prod")
+
+    record = logging.LogRecord(
+        name="app", level=logging.INFO, pathname=__file__, lineno=1,
+        msg="request", args=None, exc_info=None,
+    )
+    record.extra_fields = {"path": "/health", "status": 200, "duration_ms": 1.5}
+
+    line = JsonFormatter().format(record)
+
+    # One record per line - CloudWatch treats a newline as a record boundary.
+    assert "\n" not in line
+
+    payload = json.loads(line)
+    assert payload["version"] == "abc1234"
+    assert payload["env"] == "prod"
+    assert payload["level"] == "INFO"
+    assert payload["message"] == "request"
+    assert payload["path"] == "/health"
+    assert payload["status"] == 200
+
+
+def test_json_formatter_never_raises_on_odd_values():
+    """A log call must not be able to take the application down."""
+    record = logging.LogRecord(
+        name="app", level=logging.INFO, pathname=__file__, lineno=1,
+        msg="odd", args=None, exc_info=None,
+    )
+    record.extra_fields = {"obj": object()}          # not JSON-serialisable
+
+    payload = json.loads(JsonFormatter().format(record))
+    assert "obj" in payload
+
+
+def test_responses_carry_the_version_header(monkeypatch):
+    """X-App-Version lets you confirm the live build with curl, no console needed."""
+    monkeypatch.setenv("GIT_SHA", "abc1234")
+
+    response = client.get("/health")
+
+    assert response.headers["x-app-version"] == "abc1234"
+    assert response.headers["x-request-id"]
+
+
+def test_an_upstream_request_id_is_preserved():
+    """If a proxy already set a request id, keep it so traces join up."""
+    response = client.get("/health", headers={"X-Request-Id": "trace-me"})
+
+    assert response.headers["x-request-id"] == "trace-me"

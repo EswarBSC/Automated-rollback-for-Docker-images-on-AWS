@@ -33,6 +33,7 @@ on:
 permissions:
   contents: read
   id-token: write           # OIDC again - no AWS keys in this repo
+  deployments: write        # record that an OLDER commit is now the live one
 
 concurrency:
   # Deliberately a DIFFERENT group from the deploy workflow. If they shared a
@@ -258,6 +259,55 @@ jobs:
       # NOTE: the SSM parameter is deliberately NOT updated here. It keeps
       # pointing at the last known-good revision recorded by the deploy
       # workflow, which means running this rollback twice is safe and idempotent.
+
+      # Record in GitHub that an OLDER commit is now live.
+      #
+      # This is why both workflows use the Deployments API directly instead of
+      # the `environment:` job key: the job key would attribute this deployment
+      # to the SHA this workflow ran on (the tip of main), which is exactly the
+      # broken version we just removed. The commit actually serving traffic is
+      # the one whose SHA is the rolled-back image's tag, so that is what we
+      # register - otherwise the Environments panel would confidently show the
+      # wrong thing after every rollback.
+      - name: Record the rollback as a GitHub deployment
+        if: always() && job.status == 'success'
+        continue-on-error: true      # bookkeeping must never fail a rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          set -euo pipefail
+
+          # Whichever path we took, find the image that is now live.
+          LIVE_IMAGE="${{ steps.stop.outputs.image || steps.target.outputs.image }}"
+          LIVE_REV="${{ steps.stop.outputs.revision || steps.target.outputs.revision }}"
+          if [ -z "$LIVE_IMAGE" ]; then
+            echo "Nothing changed (no-op rollback) - leaving the deployment record alone."
+            exit 0
+          fi
+
+          # The image tag is the 7-char git SHA. Resolve it to a full SHA,
+          # because the Deployments API wants a ref it can pin.
+          TAG="${LIVE_IMAGE##*:}"
+          FULL_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha' 2>/dev/null || echo "")"
+          if [ -z "$FULL_SHA" ]; then
+            echo "::warning::Image tag ${TAG} does not resolve to a commit in this repository; skipping the deployment record."
+            exit 0
+          fi
+
+          ID="$(jq -n --arg ref "$FULL_SHA" \
+                  --arg desc "Rolled back to ${LIVE_REV} (${TAG}) by ${GITHUB_ACTOR}" \
+                  '{ref:$ref, environment:"production", description:$desc,
+                    auto_merge:false, required_contexts:[], production_environment:true}' \
+                | gh api "repos/${GITHUB_REPOSITORY}/deployments" --method POST --input - --jq '.id')"
+
+          jq -n --arg desc "Live after rollback: ${LIVE_REV} (${TAG})" --arg url "${APP_URL:-}" \
+             --arg log "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+             '{state:"success", description:$desc, log_url:$log}
+              + (if $url == "" then {} else {environment_url:$url} end)' \
+            | gh api "repos/${GITHUB_REPOSITORY}/deployments/${ID}/statuses" --method POST --input - >/dev/null
+
+          echo "GitHub now shows ${TAG} as the live production commit."
 
       - name: Write the job summary
         if: always()

@@ -1,0 +1,212 @@
+# =============================================================================
+# Version logs - pull one release's logs into GitHub.
+#
+# All versions share a single CloudWatch log group on purpose. Splitting them
+# into a log group per release would make retention, metric filters and alarms
+# unmanageable, and would make the most valuable query of all impossible:
+# comparing two releases side by side.
+#
+# Instead, every log line carries a "version" field (see app/logging_config.py)
+# and every log stream is named "<version>/app/<task-id>" (the awslogs stream
+# prefix is set to the image tag by the Deploy workflow). So one log group still
+# gives you clean per-version views, from two angles:
+#
+#   * browse  - filter streams by prefix in the CloudWatch console
+#   * query   - this workflow, using CloudWatch Logs Insights
+#
+# Read-only. Changes nothing.
+# =============================================================================
+name: Version logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image tag / 7-char git SHA, e.g. 9d6a814. Leave EMPTY for whatever is live right now.'
+        required: false
+        default: ''
+        type: string
+      minutes:
+        description: 'How far back to look, in minutes.'
+        required: false
+        default: '30'
+        type: string
+      level:
+        description: 'Only show this level and above.'
+        required: false
+        default: 'ALL'
+        type: choice
+        options: [ALL, WARNING, ERROR]
+      limit:
+        description: 'Maximum number of log lines to return.'
+        required: false
+        default: '100'
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  logs:
+    name: Fetch logs for a version
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    env:
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      LOG_GROUP: ${{ vars.LOG_GROUP }}
+      INPUT_VERSION: ${{ inputs.version }}
+      MINUTES: ${{ inputs.minutes }}
+      LEVEL: ${{ inputs.level }}
+      LIMIT: ${{ inputs.limit }}
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Work out which version to query
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
+            SOURCE="workflow input"
+          else
+            # No input: ask ECS what is live. The image tag is the git SHA.
+            LIVE_ARN="$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].taskDefinition' --output text)"
+            IMAGE="$(aws ecs describe-task-definition --task-definition "${LIVE_ARN##*/}" \
+              --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+            VERSION="${IMAGE##*:}"
+            SOURCE="currently live in ECS"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "source=${SOURCE}"   >> "$GITHUB_OUTPUT"
+          echo "Querying logs for version ${VERSION} (${SOURCE})"
+
+      - name: Run the CloudWatch Logs Insights query
+        id: query
+        run: |
+          set -euo pipefail
+          GROUP="${LOG_GROUP:-/ecs/rollback-demo}"
+          VERSION="${{ steps.version.outputs.version }}"
+          END="$(date +%s)"
+          START="$(( END - MINUTES * 60 ))"
+
+          # Filtering on the `version` field is only possible because every line
+          # is JSON - Logs Insights discovers JSON fields automatically.
+          FILTER="| filter version = \"${VERSION}\""
+          case "$LEVEL" in
+            ERROR)   FILTER="${FILTER} | filter level = \"ERROR\"" ;;
+            WARNING) FILTER="${FILTER} | filter level in [\"WARNING\", \"ERROR\"]" ;;
+          esac
+
+          QUERY="fields @timestamp, level, message, method, path, status, duration_ms, request_id
+                 ${FILTER}
+                 | sort @timestamp desc
+                 | limit ${LIMIT}"
+
+          QUERY_ID="$(aws logs start-query \
+            --log-group-name "$GROUP" \
+            --start-time "$START" --end-time "$END" \
+            --query-string "$QUERY" \
+            --query 'queryId' --output text)"
+
+          echo "Query ${QUERY_ID} started over the last ${MINUTES} minutes..."
+
+          # Insights queries are asynchronous; poll until Complete.
+          for _ in $(seq 1 60); do
+            RESULT="$(aws logs get-query-results --query-id "$QUERY_ID" --output json)"
+            STATUS="$(echo "$RESULT" | jq -r '.status')"
+            [ "$STATUS" = "Running" ] || [ "$STATUS" = "Scheduled" ] || break
+            sleep 2
+          done
+
+          if [ "$STATUS" != "Complete" ]; then
+            echo "::error::Query finished with status ${STATUS}."
+            aws logs stop-query --query-id "$QUERY_ID" >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          echo "$RESULT" > /tmp/results.json
+          COUNT="$(echo "$RESULT" | jq '.results | length')"
+          SCANNED="$(echo "$RESULT" | jq -r '.statistics.recordsScanned // 0')"
+          echo "count=${COUNT}"     >> "$GITHUB_OUTPUT"
+          echo "scanned=${SCANNED}" >> "$GITHUB_OUTPUT"
+          echo "group=${GROUP}"     >> "$GITHUB_OUTPUT"
+          echo "Returned ${COUNT} lines (scanned ${SCANNED} records)."
+
+      - name: Render the results
+        if: always()
+        run: |
+          set -euo pipefail
+          GROUP="${{ steps.query.outputs.group }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          REGION="${{ vars.AWS_REGION }}"
+
+          {
+            echo "## Logs for version \`${VERSION}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` (${{ steps.version.outputs.source }}) |"
+            echo "| Window | last ${MINUTES} minutes |"
+            echo "| Level | ${LEVEL} |"
+            echo "| Lines returned | ${{ steps.query.outputs.count || '0' }} |"
+            echo "| Records scanned | ${{ steps.query.outputs.scanned || '0' }} |"
+            echo "| Log group | \`${GROUP}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f /tmp/results.json ] && [ "${{ steps.query.outputs.count || '0' }}" != "0" ]; then
+            {
+              echo "| Time | Level | Message | Method | Path | Status | ms |"
+              echo "|---|---|---|---|---|---|---|"
+              # Each result row is a list of {field,value} pairs; flatten to an
+              # object so missing fields render as blanks rather than shifting
+              # every column along by one.
+              jq -r '.results[]
+                     | map({(.field): .value}) | add
+                     | "| \(.["@timestamp"] // "") | \(.level // "") | \(.message // "") | \(.method // "") | \(.path // "") | \(.status // "") | \(.duration_ms // "") |"' \
+                 /tmp/results.json
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "_No matching log lines._"
+              echo ""
+              echo "Either this version produced no traffic in the window, or it never ran."
+              echo "Widen **minutes**, or check the version tag is right."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "### Look deeper in the console"
+            echo ""
+            echo "[Open the log group](https://${REGION}.console.aws.amazon.com/cloudwatch/home?region=${REGION}#logsV2:log-groups)"
+            echo " — streams for this release are named \`${VERSION}/app/<task-id>\`."
+            echo ""
+            echo "Logs Insights query, ready to paste:"
+            echo ""
+            echo '```'
+            echo "fields @timestamp, level, message, method, path, status, duration_ms"
+            echo "| filter version = \"${VERSION}\""
+            echo "| sort @timestamp desc"
+            echo "| limit 100"
+            echo '```'
+            echo ""
+            echo "Compare two releases - error rate per version:"
+            echo ""
+            echo '```'
+            echo "stats count(*) as requests,"
+            echo "      sum(status >= 500) as errors,"
+            echo "      avg(duration_ms) as avg_ms,"
+            echo "      pct(duration_ms, 95) as p95_ms"
+            echo "  by version"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

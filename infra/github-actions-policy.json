@@ -64,6 +64,24 @@
       }
     },
     {
+      "Sid": "LogsInsightsQueryThisLogGroupOnly",
+      "Effect": "Allow",
+      "Action": [
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "logs:DescribeLogStreams",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "arn:aws:logs:eu-north-1:010526241989:log-group:/ecs/rollback-demo:*"
+    },
+    {
+      "Sid": "LogsInsightsReadResults",
+      "Effect": "Allow",
+      "Action": "logs:GetQueryResults",
+      "Resource": "*"
+    },
+    {
       "Sid": "SsmRollbackPointer",
       "Effect": "Allow",
       "Action": [
