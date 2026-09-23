@@ -228,6 +228,33 @@ Two distinct roles, easy to confuse:
 Add at least **2 instances** to the Auto Scaling group. A rolling deployment
 starts new tasks before stopping old ones, so it needs spare capacity somewhere.
 
+### No SSH key — use SSM Session Manager instead
+
+When the cluster wizard asks for an **EC2 key pair**, choose **"Proceed without
+a key pair"**. Then add the AWS managed policy
+**`AmazonSSMManagedInstanceCore`** to `ecsInstanceRole`.
+
+That combination gives you shell access through **Systems Manager → Session
+Manager** (or `aws ssm start-session --target i-xxxx`) with no `.pem` file, no
+inbound port 22, and no bastion host. Access is authenticated by IAM, expires
+with your session, and every command is auditable in CloudTrail.
+
+This matters for the project's security goal. A `.pem` file is a long-lived
+credential that lives on somebody's laptop, gets copied into a password manager,
+and outlives the person who created it. It is the same class of problem as an AWS
+access key in CI — which is why this project uses OIDC for GitHub. Same
+principle, two places:
+
+| Long-lived secret | Replaced by |
+|---|---|
+| AWS access keys in GitHub | OIDC — tokens minted per job, expire with it |
+| `.pem` SSH key for EC2 | SSM Session Manager — IAM-authenticated, per-session |
+
+Note what the deployment itself uses: neither SSH nor SSM Run Command. The
+pipeline calls the **ECS API** (`register-task-definition`, `update-service`),
+so nothing ever logs into a server to deploy. Session Manager is there for the
+rare occasion a human needs to inspect an instance — not for releases.
+
 ---
 
 ## About `../ecs/task-definition.json`
