@@ -1,25 +1,22 @@
 {
   "family": "rollback-demo-task",
-  "networkMode": "awsvpc",
+  "networkMode": "bridge",
   "requiresCompatibilities": [
-    "FARGATE"
+    "EC2"
   ],
   "cpu": "256",
   "memory": "512",
-  "runtimePlatform": {
-    "operatingSystemFamily": "LINUX",
-    "cpuArchitecture": "X86_64"
-  },
   "executionRoleArn": "arn:aws:iam::010526241989:role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {
       "name": "app",
       "image": "__IMAGE__",
       "essential": true,
+      "memoryReservation": 256,
       "portMappings": [
         {
           "containerPort": 8000,
-          "hostPort": 8000,
+          "hostPort": 0,
           "protocol": "tcp"
         }
       ],

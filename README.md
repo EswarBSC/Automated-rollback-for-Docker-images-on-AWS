@@ -1,6 +1,6 @@
 # Automated rollback for Docker images on AWS
 
-**One-command rollback on ECS Fargate — redeploy a previously tested image
+**One-command rollback on ECS (EC2 launch type) — redeploy a previously tested image
 without rebuilding it.**
 
 When a release goes wrong, the fastest and safest fix is to put back the exact
@@ -50,7 +50,7 @@ flowchart TB
     subgraph aws["AWS — eu-north-1"]
         ecr[("ECR<br/>rollback-demo<br/>:abc1234 :def5678 :9a8b7c6")]
         td["Task definitions<br/>rollback-demo-task:1 :2 :3<br/><i>each pins one image tag</i>"]
-        svc["ECS Fargate service<br/>rollback-demo-service"]
+        svc["ECS service on EC2<br/>rollback-demo-service"]
         ssm[("SSM Parameter<br/>previous-taskdef")]
         logs[("CloudWatch<br/>/ecs/rollback-demo")]
     end
@@ -175,20 +175,32 @@ The workflows update an existing service; they never create one. Create it once:
 1. Push to `main` with `AWS_ROLE_ARN` set. The deploy job registers
    `rollback-demo-task:1` and warns that the service does not exist — this is
    expected and the run stays green.
-2. ECS → Clusters → **Create cluster** → name `rollback-demo-cluster`, AWS
-   Fargate.
-3. Inside the cluster → Services → **Create**:
+2. ECS → Clusters → **Create cluster** → name `rollback-demo-cluster`, and under
+   *Infrastructure* choose **Amazon EC2 instances**. Create an Auto Scaling group
+   with at least **2** instances (t3.small is plenty) so a rolling deployment
+   always has somewhere to place a new task. The wizard attaches
+   `ecsInstanceRole` for you.
+3. Create an **Application Load Balancer** with a target group of type
+   **Instance** on port `8000`, health check path `/health`. Dynamic port mapping
+   means you cannot reach a task by a fixed port, so the ALB is how traffic gets
+   in — and it gives you one stable URL that survives every deploy and rollback.
+4. Inside the cluster → Services → **Create**:
+   - Launch type **EC2**
    - Task definition family `rollback-demo-task`, latest revision
    - Service name **`rollback-demo-service`** (must match exactly)
    - Desired tasks: `2` (with 1 task you get downtime during every deploy)
-   - Networking: your default VPC, and for a no-load-balancer demo turn
-     **Public IP on** and open port **8000** in the security group
+   - **Load balancing** → your ALB and the target group from step 3
    - **Deployment failure detection** → tick *circuit breaker* and *Rollback on
-     failure* (needed for Scene 5 of the demo)
-4. Find the task's public IP under Tasks → Networking, and open
-   `http://<public-ip>:8000`.
+     failures* (needed for Scene 5 of the demo)
+5. Open the ALB's DNS name in a browser.
 
 From then on, every push to `main` deploys automatically.
+
+> **Why `hostPort: 0` in the task definition.** On EC2, a fixed host port means
+> only one task per instance, and a rolling update then deadlocks: ECS cannot
+> start the new task because the port is still held by the old one. `hostPort: 0`
+> asks Docker for a free ephemeral port, so old and new tasks coexist on the same
+> instance during a deployment. The ALB discovers the actual port automatically.
 
 ### Run it locally
 
@@ -215,7 +227,7 @@ docker run --rm -p 8000:8000 rollback-demo:local-test
 app/main.py                 FastAPI app; edit APP_COLOR / BANNER_MESSAGE for demos
 tests/test_app.py           pytest suite — the first gate in CI
 Dockerfile                  python:3.12-slim, non-root, GIT_SHA baked in at build time
-ecs/task-definition.json    Fargate task definition template ("__IMAGE__" placeholder)
+ecs/task-definition.json    ECS/EC2 task definition template ("__IMAGE__" placeholder)
 infra/                      IAM policies + console set-up instructions
 scripts/rollback.sh         Terminal rollback, same logic as the workflow
 docs/DEMO.md                Step-by-step demo script for presenting this
@@ -260,8 +272,9 @@ The CloudWatch log group `/ecs/rollback-demo` does not exist, or
 `ecsTaskExecutionRole` cannot write to it. Create the group manually.
 
 **Tasks stop with `CannotPullContainerError`.**
-Fargate tasks in a private subnet need a NAT gateway or VPC endpoints to reach
-ECR. For a demo, a public subnet with *Assign public IP = ENABLED* is simplest.
+Your EC2 container instances cannot reach ECR. They need either a public subnet
+with a public IP, a NAT gateway, or VPC endpoints for ECR and S3. Also confirm
+the instance profile includes `AmazonEC2ContainerServiceforEC2Role`.
 
 **The deploy fails with "ECS automatically rolled back to …".**
 Working as designed: the new version failed its health checks and ECS restored

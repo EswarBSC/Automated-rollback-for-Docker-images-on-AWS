@@ -11,8 +11,11 @@ the point. Total runtime ≈ 20 minutes.
 - Have a terminal ready in the repo.
 - Run one deploy the day before so `rollback-demo-task:1` exists, ECR has at
   least one image, and nothing is being built for the first time live.
-- Know your app URL (the task's public IP on port 8000, or your load balancer
-  DNS name).
+- Know your app URL: the **load balancer's DNS name**. On the EC2 launch type
+  the task definition uses dynamic port mapping (`hostPort: 0`), so there is no
+  fixed `host:port` to browse — the ALB is the entry point, and it stays the
+  same across every deploy and rollback. That stability is a feature: the
+  audience watches one URL change content, never a URL that stops working.
 
 Throughout, keep pointing at one thing: **the image tag**. Every scene is a
 variation on "the tag that is live changed / did not change, and no build ran".

@@ -1,5 +1,5 @@
 # =============================================================================
-# Deploy - build once, test, then ship to ECS Fargate.
+# Deploy - build once, test, then ship to ECS on EC2.
 #
 # The rules this workflow enforces:
 #   * every image is tagged with the 7-char git SHA. ":latest" is never used.

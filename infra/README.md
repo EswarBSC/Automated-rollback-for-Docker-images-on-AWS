@@ -202,6 +202,34 @@ is not blocked on an IAM task.
 
 ---
 
+## `ecsInstanceRole` — required because this runs on EC2, not Fargate
+
+Fargate needs no instance role, because there are no instances. With the **EC2
+launch type** every container instance runs the ECS agent, and that agent needs
+permission to register itself with your cluster and report task state.
+
+The **Create cluster** wizard creates this for you when you choose *Amazon EC2
+instances* and let it build the Auto Scaling group. Verify afterwards:
+
+**IAM → Roles → `ecsInstanceRole`** → it must have
+**`AmazonEC2ContainerServiceforEC2Role`** attached.
+
+If instances never appear under the cluster's **Infrastructure** tab, this role
+is almost always the reason — the instance boots fine but cannot join the
+cluster, so ECS has nowhere to place tasks and your deployment hangs forever.
+
+Two distinct roles, easy to confuse:
+
+| Role | Assumed by | Job |
+|---|---|---|
+| `ecsInstanceRole` | the EC2 instance | join the cluster, run the ECS agent |
+| `ecsTaskExecutionRole` | `ecs-tasks.amazonaws.com` | pull the image from ECR, write logs |
+
+Add at least **2 instances** to the Auto Scaling group. A rolling deployment
+starts new tasks before stopping old ones, so it needs spare capacity somewhere.
+
+---
+
 ## About `../ecs/task-definition.json`
 
 That file is a **template**, not something you paste as-is:
@@ -211,6 +239,27 @@ That file is a **template**, not something you paste as-is:
 - It contains no JSON comments and no extra keys, because
   `aws ecs register-task-definition` rejects any field it does not recognise —
   including a well-meaning `"_comment"`.
+
+### The EC2-specific settings in it
+
+| Setting | Value | Why |
+|---|---|---|
+| `requiresCompatibilities` | `["EC2"]` | Registering with `FARGATE` here would be rejected by an EC2-only cluster |
+| `networkMode` | `bridge` | The normal EC2 mode. `awsvpc` also works but gives each task its own ENI, which caps how many tasks fit on an instance |
+| `hostPort` | `0` | **Dynamic port mapping.** Docker picks a free ephemeral port |
+| `memoryReservation` | `256` | Soft limit. ECS packs tasks onto instances using this, while `memory` stays the hard ceiling |
+| `runtimePlatform` | *removed* | It pinned `X86_64`, which would refuse to run on Graviton instances. On EC2 the instance decides the architecture |
+
+**Why `hostPort: 0` matters more than it looks.** With a fixed host port, only
+one task can run per instance — and a rolling update then deadlocks, because ECS
+cannot start the replacement task while the old one still holds the port. The
+deployment sits at `IN_PROGRESS` until it times out. Dynamic ports let the old
+and new task coexist on the same instance for the few seconds of a rollout, which
+is exactly what "zero downtime" requires. The load balancer's target group
+discovers the real port automatically.
+
+This is also why the EC2 setup needs an **Application Load Balancer**: with a
+random ephemeral port, there is no fixed `host:port` for a browser to hit.
 
 If you ever register it manually (for the very first service creation), replace
 `__IMAGE__` yourself with a real tag such as
