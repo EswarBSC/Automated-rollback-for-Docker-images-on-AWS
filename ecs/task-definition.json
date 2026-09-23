@@ -27,7 +27,7 @@
         },
         {
           "name": "FAIL_HEALTH",
-          "value": "false"
+          "value": "true"
         },
         {
           "name": "SIMULATE_ERRORS",
