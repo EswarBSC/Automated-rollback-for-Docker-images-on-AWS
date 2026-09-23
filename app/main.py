@@ -10,9 +10,13 @@ straight back.
 
 import os
 import socket
+import time
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from app.logging_config import configure_logging
 
 # ---------------------------------------------------------------------------
 # EDIT THESE FOR DEMOS
@@ -27,7 +31,77 @@ BANNER_MESSAGE = "v2 — BROKEN RELEASE"
 
 # ---------------------------------------------------------------------------
 
+log = configure_logging()
+
 app = FastAPI(title="ECS Rollback Demo")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Emit one structured log line per request, and stamp the version on the
+    response.
+
+    Two things come out of this:
+
+    * every request line carries `version`, so CloudWatch Logs Insights can
+      filter or group by release - that is what makes per-version log analysis
+      possible;
+    * every response carries `X-App-Version`, so you can confirm which build
+      answered you with `curl -I` and no console access at all.
+    """
+    start = time.perf_counter()
+
+    # Honour an upstream request id if there is one (an ALB or a gateway may
+    # set it); otherwise mint one so a single request can be followed across
+    # every line it produces.
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Log the failure with the same structured fields before re-raising, so
+        # a 500 is never invisible in CloudWatch.
+        log.exception(
+            "request failed",
+            extra={
+                "extra_fields": {
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                }
+            },
+        )
+        raise
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    # 5xx is an error, 4xx is the caller's problem, everything else is routine.
+    # Getting this right means "filter level = ERROR" is actually meaningful.
+    if response.status_code >= 500:
+        level = log.error
+    elif response.status_code >= 400:
+        level = log.warning
+    else:
+        level = log.info
+
+    level(
+        "request",
+        extra={
+            "extra_fields": {
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+                "client": request.client.host if request.client else None,
+            }
+        },
+    )
+
+    response.headers["X-App-Version"] = _git_sha()
+    response.headers["X-Request-Id"] = request_id
+    return response
 
 
 # Environment variables are read *inside* the request handlers, never at import
@@ -179,3 +253,19 @@ def version() -> JSONResponse:
         },
         status_code=200,
     )
+
+
+# Logged once when the container boots. Gives every task a definitive "I am
+# version X" line at a known point in the stream - the first thing to look for
+# when you are working out which release produced a given log.
+log.info(
+    "application started",
+    extra={
+        "extra_fields": {
+            "version": _git_sha(),
+            "env": _app_env(),
+            "color": APP_COLOR,
+            "banner": BANNER_MESSAGE,
+        }
+    },
+)

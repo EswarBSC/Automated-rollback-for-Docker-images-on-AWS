@@ -25,6 +25,7 @@ on:
 permissions:
   contents: read            # read the repo
   id-token: write           # REQUIRED for OIDC: lets GitHub mint the token AWS trusts
+  deployments: write        # record what is live in the Environments panel
 
 concurrency:
   group: deploy-prod        # only one production deploy at a time...
@@ -208,14 +209,25 @@ jobs:
         id: register
         run: |
           set -euo pipefail
-          # Put the real image URI into the __IMAGE__ placeholder. jq is used
-          # (not sed) so we fail loudly if the JSON is malformed.
-          jq --arg image "$IMAGE" --arg name "$CONTAINER_NAME" \
-            '(.containerDefinitions[] | select(.name == $name) | .image) = $image' \
-            ecs/task-definition.json > /tmp/taskdef.json
+          # Two placeholders get filled in here. jq is used (not sed) so we fail
+          # loudly if the JSON is malformed rather than writing corrupt output.
+          #
+          #   __IMAGE__    -> the full ECR image URI for this commit
+          #   __VERSION__  -> the awslogs stream prefix, set to the image tag
+          #
+          # The stream prefix is the whole trick behind per-version log
+          # filtering. ECS names each log stream "<prefix>/<container>/<task-id>",
+          # so with the prefix set to the git SHA every stream is labelled with
+          # the release that produced it, and the CloudWatch console can filter
+          # streams by prefix with no query language at all.
+          jq --arg image "$IMAGE" --arg name "$CONTAINER_NAME" --arg version "$IMAGE_TAG" '
+              (.containerDefinitions[] | select(.name == $name) | .image) = $image
+            | (.containerDefinitions[] | select(.name == $name)
+                 | .logConfiguration.options["awslogs-stream-prefix"]) = $version
+          ' ecs/task-definition.json > /tmp/taskdef.json
 
-          if grep -q '__IMAGE__' /tmp/taskdef.json; then
-            echo "::error::Placeholder __IMAGE__ was not replaced. Does ecs/task-definition.json contain a container named '${CONTAINER_NAME}'?"
+          if grep -qE '__IMAGE__|__VERSION__' /tmp/taskdef.json; then
+            echo "::error::A placeholder was not replaced. Does ecs/task-definition.json contain a container named '${CONTAINER_NAME}' with a logConfiguration?"
             exit 1
           fi
 

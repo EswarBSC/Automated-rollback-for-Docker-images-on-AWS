@@ -39,7 +39,7 @@
         "options": {
           "awslogs-group": "/ecs/rollback-demo",
           "awslogs-region": "eu-north-1",
-          "awslogs-stream-prefix": "app"
+          "awslogs-stream-prefix": "__VERSION__"
         }
       },
       "healthCheck": {
