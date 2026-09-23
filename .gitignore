@@ -27,3 +27,6 @@ ENV/
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+# Local scratch notes
+extra.txt
