@@ -93,8 +93,10 @@ ECR.**
 3. **`deploy`** —
    - `jq` replaces the `__IMAGE__` placeholder in `ecs/task-definition.json`;
    - registers it as a new revision (`rollback-demo-task:N`);
-   - reads what the service is running **now** and writes that to the SSM
-     parameter — *this is the rollback target*;
+   - decides whether the outgoing revision has **proved itself** (rollout
+     completed, all tasks running, none failed, alive for `SOAK_MINUTES`) and
+     only then promotes it to the SSM pointer — *this is the rollback target*.
+     A revision that has not proved itself leaves the pointer untouched;
    - `update-service` to the new revision;
    - polls every 15s for up to 20 minutes, printing the rollout state and the
      latest service event;
@@ -158,7 +160,8 @@ hardcoded in any workflow file.
 | `ECS_SERVICE` | `rollback-demo-service` | The service that gets updated |
 | `TASK_FAMILY` | `rollback-demo-task` | Used to expand a bare revision number like `5` |
 | `CONTAINER_NAME` | `app` | Which container in the task definition gets the new image |
-| `SSM_PREVIOUS_PARAM` | `/rollback-demo/prod/previous-taskdef` | Stores the rollback target |
+| `SSM_PREVIOUS_PARAM` | `/rollback-demo/prod/previous-taskdef` | Stores the rollback target (**last known good**, not merely the previous revision) |
+| `SOAK_MINUTES` | `15` | Optional. How long a revision must run healthily before it is promoted to last known good |
 | `LOG_GROUP` | `/ecs/rollback-demo` | Optional. Log group the *Version logs* workflow queries |
 | `APP_URL` | the ALB URL | Optional. Lets *What is live?* ask the app directly, and adds a clickable link to deployment records |
 

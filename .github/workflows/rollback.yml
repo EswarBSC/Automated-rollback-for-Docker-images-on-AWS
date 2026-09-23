@@ -161,14 +161,18 @@ jobs:
             esac
             echo "Target from workflow input: ${TARGET}"
           else
-            # No input: use the revision the last deploy saved before switching.
+            # No input: use the LAST KNOWN GOOD revision. The deploy workflow
+            # only writes this pointer once a revision has completed its
+            # rollout, run every task healthily and survived a soak period - so
+            # it is never merely "whatever ran before", which could itself be
+            # the bad release when two deploys happen in quick succession.
             TARGET="$(aws ssm get-parameter --name "$SSM_PREVIOUS_PARAM" \
               --query 'Parameter.Value' --output text 2>/dev/null || echo "")"
             if [ -z "$TARGET" ] || [ "$TARGET" = "None" ]; then
               echo "::error::No revision was given and the SSM parameter ${SSM_PREVIOUS_PARAM} is empty or missing. Run a deploy first, or pass a revision number to this workflow."
               exit 1
             fi
-            echo "Target from SSM (${SSM_PREVIOUS_PARAM}): ${TARGET}"
+            echo "Target from SSM, last known good (${SSM_PREVIOUS_PARAM}): ${TARGET}"
           fi
 
           # Confirm the revision really exists before touching the service.
@@ -309,6 +313,25 @@ jobs:
 
           echo "GitHub now shows ${TAG} as the live production commit."
 
+      # If the last known good turns out to be bad too, the operator needs to
+      # see what else is available without digging through the ECS console.
+      - name: Read the known-good history
+        id: history
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          HIST_PARAM="${SSM_PREVIOUS_PARAM%/*}/known-good-history"
+          HIST="$(aws ssm get-parameter --name "$HIST_PARAM" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo '[]')"
+          case "$HIST" in ''|None) HIST='[]' ;; esac
+          echo "$HIST" | jq -e 'type == "array"' >/dev/null 2>&1 || HIST='[]'
+
+          # Render as markdown table rows now; the summary step only prints.
+          echo "$HIST" | jq -r '.[] | "| `\(.revision)` | `\(.image | split(":") | last)` | \(.promoted_at) | \(.soak_minutes)m |"' \
+            > /tmp/history_rows.md
+          echo "count=$(echo "$HIST" | jq 'length')" >> "$GITHUB_OUTPUT"
+
       - name: Write the job summary
         if: always()
         run: |
@@ -329,4 +352,17 @@ jobs:
             echo "| Result | **${{ job.status }}** |"
             echo ""
             echo "**No image was built during this rollback.** The service was pointed at a task definition revision that already existed, running an image that was already in ECR and had already passed unit tests, the smoke test and a production rollout."
+            echo ""
+
+            if [ -s /tmp/history_rows.md ]; then
+              echo "### Other known-good revisions"
+              echo ""
+              echo "If this target is also bad, re-run the workflow with one of these in the **revision** input."
+              echo "A revision only appears here after it completed its rollout, ran every task healthily and survived a soak period in production."
+              echo ""
+              echo "| Revision | Image tag | Promoted at | Soaked |"
+              echo "|---|---|---|---|"
+              cat /tmp/history_rows.md
+              echo ""
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

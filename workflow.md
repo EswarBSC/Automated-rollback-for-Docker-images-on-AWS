@@ -1003,3 +1003,114 @@ nothing rather than failing loudly:
 Verified locally against a real container: every line is JSON including
 uvicorn's, a 404 logs at `WARNING`, a 500 logs at `ERROR`, and `X-App-Version`
 matches the build argument.
+
+---
+
+## A6. "Last known good" instead of "the previous revision"
+
+The most important correctness fix in the project, raised when reviewing whether
+the rollback design matched industry practice.
+
+### The bug
+
+The deploy workflow used to save whatever was running immediately before the
+switch. That is wrong in a specific and dangerous way:
+
+```
+:7 good  →  deploy :8 (bad)  →  pointer = :7   ✅ correct
+         →  deploy :9        →  pointer = :8   ❌ now aims at the BAD release
+```
+
+Ship a bad release, fail to notice, ship again — and the one-click rollback now
+lands you on broken code, in the middle of an incident, which is the worst
+possible moment to discover it. Nothing in the pipeline would have warned you;
+the pointer would look perfectly healthy.
+
+### The rule
+
+A revision is promoted to *last known good* only once it has **proved itself in
+production**. All four conditions must hold:
+
+| Condition | Why |
+|---|---|
+| `rolloutState == COMPLETED` | The deployment actually finished, rather than stalling or failing |
+| `runningCount == desiredCount` | Every task is up, not a degraded subset |
+| `failedTasks == 0` | Nothing crashed and got replaced during the window |
+| Alive for ≥ `SOAK_MINUTES` (default 15) | Enough real traffic to expose a problem |
+
+If the outgoing revision does not qualify, **the pointer is left exactly as it
+was** — still aiming at the last revision that did earn the label. The run
+prints a `::notice::` saying which condition failed and what the pointer still
+holds, so this is visible rather than silent.
+
+Being conservative here costs nothing: the worst case is rolling back one
+version further than strictly necessary. Being wrong costs an outage.
+
+### Bootstrap case
+
+If no known-good revision exists at all yet (a brand-new environment), the
+outgoing revision is recorded anyway, with a `::warning::` explaining that it
+did not qualify. A target you are unsure about still beats having nowhere to
+roll back to.
+
+### Known-good history
+
+Promotion also prepends to `/rollback-demo/prod/known-good-history`, a JSON list
+of the last 10 promoted revisions with their image tag, promotion time and how
+long they soaked. Deduplicated, newest first, capped at 10 so it stays well
+inside the 4 KB Standard-tier parameter limit.
+
+The Rollback workflow prints it in the job summary, and `scripts/rollback.sh`
+prints it to the terminal. If the newest known-good turns out to be bad as well,
+the operator can see the alternatives immediately rather than digging through
+the ECS console during an incident.
+
+**No new AWS setup is needed** — the parameter is created on first promotion,
+and the IAM policy already covers it through the `/rollback-demo/prod/*`
+wildcard.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SOAK_MINUTES` | `15` | How long a revision must run healthily before promotion. Raise it on a low-traffic service where 15 minutes proves little |
+
+### What it does not change
+
+- The Rollback workflow still accepts an **explicit revision** — the manual
+  escape hatch is unchanged, and now the history tells you what to type.
+- The pointer is still never written by the rollback workflow, so running a
+  rollback twice remains safe.
+- A revision that is currently live never needs to be in the history: you cannot
+  need to roll back *to* what you are already running.
+
+### Tested
+
+The promotion logic was exercised against synthetic `describe-services` output
+before shipping — 13 cases, all passing, including the exact scenario the fix
+exists for:
+
+```
+PASS  healthy, soaked 40m                      -> promote
+PASS  healthy but only 3m old (second deploy)  -> keep:rollback-demo-task:7 (live for 3m, needs 15m)
+PASS  rollout FAILED                           -> keep:rollback-demo-task:7
+PASS  only 1 of 2 tasks running                -> keep:rollback-demo-task:7
+PASS  tasks failed during the window           -> keep:rollback-demo-task:7
+PASS  no pointer yet, unhealthy                -> bootstrap
+PASS  re-promote does not duplicate            -> 3 entries
+PASS  capped at 10, stays under 4KB
+```
+
+### Related improvements deliberately not made
+
+Raised in the same review and worth knowing about, but out of scope here:
+
+| Improvement | Why not now |
+|---|---|
+| **ECS deployment alarms** (`deploymentConfiguration.alarms`) | The highest-value remaining gap. The circuit breaker only catches tasks that fail to start; alarms would catch healthy tasks serving 500s — automating what is currently Scene 6's manual rollback |
+| **Blue/green with canary shifting** | Rollback in seconds rather than minutes, and problems caught at 10% of traffic. Costs an extra task set and more moving parts |
+| **Feature flags** (AWS AppConfig, LaunchDarkly) | Decouples deploy from release, turning most bad releases into a config toggle. Changes how the team works, not just the pipeline |
+| **ECR lifecycle policy** | Needed eventually for cost, but a naive `keep last N` rule can **delete your rollback targets** — must exclude images still referenced by task definitions |
+| **Image digest pinning and signing** | Makes "only tested images ship" provable rather than asserted |
+| **IaC for the cluster, ALB and IAM** | Deliberately omitted so a beginner can see each AWS object. Required for a real production estate |
+| **Expand/contract schema discipline** | The hard limit on *every* image-rollback strategy: rollback covers the application tier only |

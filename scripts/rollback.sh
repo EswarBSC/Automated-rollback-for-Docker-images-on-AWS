@@ -135,11 +135,26 @@ if [ -n "$INPUT_REVISION" ]; then
   esac
   log "Target from argument: ${TARGET}"
 else
+  # The LAST KNOWN GOOD revision, not merely the previous one. The deploy
+  # workflow only writes this pointer once a revision has completed its rollout,
+  # run every task healthily and survived a soak period - so two deploys in
+  # quick succession cannot leave it aiming at the bad release.
   TARGET="$("${AWS[@]}" ssm get-parameter --name "$SSM_PREVIOUS_PARAM" \
     --query 'Parameter.Value' --output text 2>/dev/null || echo "")"
   [ -n "$TARGET" ] && [ "$TARGET" != "None" ] \
     || die "No revision given and ${SSM_PREVIOUS_PARAM} is empty/missing. Deploy once first, or pass a revision: ./scripts/rollback.sh 3"
-  log "Target from SSM (${SSM_PREVIOUS_PARAM}): ${TARGET}"
+  log "Target from SSM, last known good (${SSM_PREVIOUS_PARAM}): ${TARGET}"
+
+  # Show the alternatives, in case this target turns out to be bad as well.
+  HISTORY="$("${AWS[@]}" ssm get-parameter --name "${SSM_PREVIOUS_PARAM%/*}/known-good-history" \
+    --query 'Parameter.Value' --output text 2>/dev/null || echo '[]')"
+  case "$HISTORY" in ''|None) HISTORY='[]' ;; esac
+  if echo "$HISTORY" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+    echo
+    echo "  Known-good history (pass one of these as an argument if needed):"
+    echo "$HISTORY" | jq -r '.[] | "    \(.revision)  image \(.image | split(":") | last)  promoted \(.promoted_at)  soaked \(.soak_minutes)m"'
+    echo
+  fi
 fi
 
 # Never touch the service until we know the target really exists.

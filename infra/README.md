@@ -172,9 +172,24 @@ wrong. Do not guess them — run the `Debug OIDC` workflow (in
 - Value: `rollback-demo-task:1` (any placeholder — the deploy workflow
   overwrites it on every deploy)
 
-The deploy workflow writes the **outgoing** revision here just before switching
-over. The rollback workflow reads it. That one string is what makes rollback a
-single click with no arguments.
+The deploy workflow writes the **last known good** revision here, and the
+rollback workflow reads it. That one string is what makes rollback a single
+click with no arguments.
+
+"Last known good" rather than "the previous one" is deliberate. A revision is
+only promoted once it has completed its rollout, run every task healthily,
+suffered no task failures, and survived in production for `SOAK_MINUTES`
+(default 15). Otherwise the pointer is left pointing at the last revision that
+did. Without that rule, shipping a bad release and then shipping again would
+overwrite the good pointer with the bad revision — and the one-click rollback
+would take you to broken code.
+
+The deploy workflow also maintains a second parameter alongside it,
+`/rollback-demo/prod/known-good-history`, holding a JSON list of the last 10
+promoted revisions. **You do not need to create this one** — it is written
+automatically, and the IAM policy already covers it via the
+`/rollback-demo/prod/*` wildcard. The Rollback workflow prints it in its summary
+so an operator can walk further back if the newest known-good is also suspect.
 
 ---
 

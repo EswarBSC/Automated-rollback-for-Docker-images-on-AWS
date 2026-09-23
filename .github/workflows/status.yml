@@ -164,7 +164,7 @@ jobs:
             echo "| Registered at | ${{ steps.ecs.outputs.registered }} |"
             echo "| Tasks | ${{ steps.ecs.outputs.running }} / ${{ steps.ecs.outputs.desired }} running |"
             echo "| Rollout state | ${{ steps.ecs.outputs.state }} (${{ steps.ecs.outputs.deployments }} deployment/s) |"
-            echo "| Rollback target in SSM | \`${{ steps.ssm.outputs.target }}\` |"
+            echo "| Rollback target (last known good) | \`${{ steps.ssm.outputs.target }}\` |"
             echo ""
 
             if [ "${{ steps.commit.outputs.found }}" = "true" ]; then

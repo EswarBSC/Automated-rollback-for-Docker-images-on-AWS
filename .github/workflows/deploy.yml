@@ -281,21 +281,117 @@ jobs:
             echo "same=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # THE ROLLBACK POINTER. Before we change anything, remember what was
-      # running. This is deliberately saved as "family:revision" - a pointer to
-      # an already-built, already-tested image - which is why rollback never
-      # needs to build anything.
-      - name: Save the outgoing revision as the rollback target
+      # THE ROLLBACK POINTER - "last known good", not merely "the previous one".
+      #
+      # The naive version of this step saved whatever happened to be running
+      # before the switch. That is wrong in a specific and dangerous way: ship a
+      # bad release, fail to notice, ship again, and the pointer now holds the
+      # BAD revision. The one-click rollback then lands you on broken code, in
+      # the middle of an incident, which is the worst possible moment to
+      # discover it.
+      #
+      #   :7 good  ->  deploy :8 bad  ->  pointer = :7   correct
+      #            ->  deploy :9      ->  pointer = :8   BROKEN
+      #
+      # So a revision is only promoted once it has PROVED itself in production:
+      # the rollout completed, every task is running, none failed, and it has
+      # survived for at least SOAK_MINUTES. If the outgoing revision does not
+      # qualify, the pointer is left exactly as it was - still aiming at the last
+      # revision that did. Being conservative here costs nothing; being wrong
+      # costs an outage.
+      - name: Promote the outgoing revision if it proved itself
         id: save
         if: steps.service.outputs.exists == 'true' && steps.current.outputs.same == 'false'
+        env:
+          # Override with a repository variable if your traffic is slow enough
+          # that 15 minutes is not a meaningful soak.
+          SOAK_MINUTES: ${{ vars.SOAK_MINUTES || '15' }}
+          OUTGOING: ${{ steps.current.outputs.revision }}
         run: |
           set -euo pipefail
-          aws ssm put-parameter \
-            --name "$SSM_PREVIOUS_PARAM" \
-            --type String \
-            --value "${{ steps.current.outputs.revision }}" \
-            --overwrite >/dev/null
-          echo "Rollback target saved to ${SSM_PREVIOUS_PARAM}: ${{ steps.current.outputs.revision }}"
+
+          # --- How has the outgoing revision actually behaved? ---------------
+          SVC="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0]' --output json)"
+          PRIMARY="$(echo "$SVC" | jq -c '[.deployments[] | select(.status=="PRIMARY")][0] // {}')"
+
+          STATE="$(echo "$PRIMARY"   | jq -r '.rolloutState // "UNKNOWN"')"
+          RUNNING="$(echo "$PRIMARY" | jq -r '.runningCount // 0')"
+          DESIRED="$(echo "$PRIMARY" | jq -r '.desiredCount // 0')"
+          FAILED="$(echo "$PRIMARY"  | jq -r '.failedTasks // 0')"
+          CREATED="$(echo "$PRIMARY" | jq -r '.createdAt // empty')"
+
+          AGE_MIN=0
+          if [ -n "$CREATED" ]; then
+            AGE_MIN=$(( ( $(date +%s) - $(date -d "$CREATED" +%s) ) / 60 ))
+          fi
+          echo "Outgoing ${OUTGOING}: state=${STATE} tasks=${RUNNING}/${DESIRED} failed=${FAILED} age=${AGE_MIN}m"
+
+          # What does the pointer hold right now?
+          POINTER="$(aws ssm get-parameter --name "$SSM_PREVIOUS_PARAM" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")"
+          case "$POINTER" in None) POINTER="" ;; esac
+
+          # --- Does it qualify as known good? --------------------------------
+          QUALIFIES=true
+          REASON=""
+          add_reason() { REASON="${REASON:+$REASON; }$1"; QUALIFIES=false; }
+
+          [ "$STATE" = "COMPLETED" ] || add_reason "rollout state is ${STATE}"
+          { [ "$DESIRED" -gt 0 ] && [ "$RUNNING" -eq "$DESIRED" ]; } \
+            || add_reason "only ${RUNNING}/${DESIRED} tasks running"
+          [ "$FAILED" -eq 0 ] || add_reason "${FAILED} task(s) failed"
+          [ "$AGE_MIN" -ge "$SOAK_MINUTES" ] \
+            || add_reason "live for ${AGE_MIN}m, needs ${SOAK_MINUTES}m to soak"
+
+          promote() {
+            aws ssm put-parameter --name "$SSM_PREVIOUS_PARAM" \
+              --type String --value "$OUTGOING" --overwrite >/dev/null
+
+            # Keep a short history so an operator can walk back more than one
+            # step when the last known good is itself suspect.
+            IMG="$(aws ecs describe-task-definition --task-definition "$OUTGOING" \
+              --query 'taskDefinition.containerDefinitions[0].image' --output text 2>/dev/null || echo "unknown")"
+            HIST_PARAM="${SSM_PREVIOUS_PARAM%/*}/known-good-history"
+            OLD="$(aws ssm get-parameter --name "$HIST_PARAM" \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo '[]')"
+            case "$OLD" in ''|None) OLD='[]' ;; esac
+            echo "$OLD" | jq -e 'type == "array"' >/dev/null 2>&1 || OLD='[]'
+
+            # Newest first, de-duplicated, capped at 10 so the parameter stays
+            # well inside the 4 KB Standard-tier limit.
+            echo "$OLD" | jq -c \
+              --arg rev "$OUTGOING" --arg img "$IMG" \
+              --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson soak "$AGE_MIN" \
+              '[{revision:$rev, image:$img, promoted_at:$at, soak_minutes:$soak}]
+               + map(select(.revision != $rev)) | .[0:10]' > /tmp/history.json
+            aws ssm put-parameter --name "$HIST_PARAM" \
+              --type String --value "$(cat /tmp/history.json)" --overwrite >/dev/null
+          }
+
+          if [ "$QUALIFIES" = "true" ]; then
+            promote
+            echo "promoted=true" >> "$GITHUB_OUTPUT"
+            echo "pointer=${OUTGOING}" >> "$GITHUB_OUTPUT"
+            echo "reason=proved itself: ${STATE}, ${RUNNING}/${DESIRED} tasks, ${AGE_MIN}m in production" >> "$GITHUB_OUTPUT"
+            echo "::notice::Promoted ${OUTGOING} to last known good (${AGE_MIN}m healthy in production)."
+          elif [ -z "$POINTER" ]; then
+            # Bootstrap: there is no known-good revision at all yet. A target we
+            # are unsure about still beats having nowhere to roll back to.
+            promote
+            echo "promoted=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "pointer=${OUTGOING}" >> "$GITHUB_OUTPUT"
+            echo "reason=no previous known good existed; recorded despite: ${REASON}" >> "$GITHUB_OUTPUT"
+            echo "::warning::No known-good revision existed, so ${OUTGOING} was recorded even though it did not qualify (${REASON})."
+          else
+            echo "promoted=false" >> "$GITHUB_OUTPUT"
+            echo "pointer=${POINTER}" >> "$GITHUB_OUTPUT"
+            echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+            echo "::notice::${OUTGOING} was NOT promoted (${REASON}). The rollback target stays at ${POINTER}, which is the last revision that proved itself."
+          fi
+
+          echo "age=${AGE_MIN}" >> "$GITHUB_OUTPUT"
 
       # Tell GitHub a deployment is starting. This is what populates the
       # "Environments" panel on the repository home page, so anyone can see
@@ -442,8 +538,10 @@ jobs:
             echo "| Image | \`${IMAGE:-n/a}\` |"
             echo "| Image reused from ECR | ${{ needs.build.outputs.reused }} |"
             echo "| New task definition | \`${{ steps.register.outputs.revision || 'not registered' }}\` |"
-            echo "| Previous revision (rollback target) | \`${{ steps.current.outputs.revision || 'none saved' }}\` |"
-            echo "| Saved to SSM | \`${SSM_PREVIOUS_PARAM}\` |"
+            echo "| Outgoing revision | \`${{ steps.current.outputs.revision || 'n/a' }}\` |"
+            echo "| **Rollback target** (last known good) | \`${{ steps.save.outputs.pointer || 'none saved' }}\` |"
+            echo "| Promoted this run? | \`${{ steps.save.outputs.promoted || 'n/a' }}\` — ${{ steps.save.outputs.reason || 'no promotion attempted' }} |"
+            echo "| Pointer stored in | \`${SSM_PREVIOUS_PARAM}\` |"
             echo "| Live revision after deploy | \`${{ steps.verify.outputs.live || 'n/a' }}\` |"
             echo "| Log stream prefix | \`${IMAGE_TAG:-n/a}/app/\` |"
             echo "| Result | **${{ job.status }}** |"
