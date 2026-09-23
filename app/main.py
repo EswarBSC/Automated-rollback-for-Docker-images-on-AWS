@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 # Change them, commit, push -> a new image is built and deployed. The previous
 # image stays in ECR untouched, which is what makes rollback instant.
 APP_COLOR = "#dc2626"                    # red
-BANNER_MESSAGE = "v2 — BROKEN RELEASE"
+BANNER_MESSAGE = "v2 — BROKEN"
 
 # ---------------------------------------------------------------------------
 
