@@ -1,0 +1,67 @@
+# =============================================================================
+# Debug OIDC - a temporary diagnostic workflow. DELETE IT once OIDC works.
+#
+# It answers the two questions the "Not authorized to perform
+# sts:AssumeRoleWithWebIdentity" error refuses to answer:
+#
+#   1. What exactly is stored in the AWS_ROLE_ARN variable? (stray spaces,
+#      newlines and copy-paste mistakes are invisible in the GitHub UI)
+#   2. What claims is GitHub actually putting in the token? The "sub" and "aud"
+#      values here must match your IAM role's trust policy character for
+#      character.
+#
+# It prints CLAIMS only, never the token itself - the token is a credential.
+# =============================================================================
+name: Debug OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # needed to request the OIDC token at all
+
+jobs:
+  debug:
+    name: Show OIDC claims and role ARN
+    runs-on: ubuntu-latest
+    steps:
+      - name: What is actually stored in AWS_ROLE_ARN?
+        env:
+          ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          # The >>> <<< markers make leading/trailing whitespace visible.
+          printf 'value  >>>%s<<<\n' "$ARN"
+          printf 'length: %s characters\n' "${#ARN}"
+          # A correct ARN for this project is 60 characters:
+          # arn:aws:iam::010526241989:role/github-actions-rollback-demo
+          case "$ARN" in
+            arn:aws:iam::*:role/*) echo "shape: looks like a role ARN" ;;
+            *) echo "shape: NOT a role ARN - this is the problem" ;;
+          esac
+
+      - name: What claims is GitHub sending?
+        run: |
+          set -euo pipefail
+          # Ask GitHub for an OIDC token with the audience AWS expects.
+          TOKEN="$(curl -sS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | jq -r '.value')"
+
+          # A JWT is three base64url parts separated by dots. The middle part is
+          # the claims. base64url needs '-_' swapped back to '+/' and '=' padding
+          # restored before a normal base64 decoder will accept it.
+          PAYLOAD="$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')"
+          case $(( ${#PAYLOAD} % 4 )) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+          esac
+
+          echo "--- claims AWS will evaluate against your trust policy ---"
+          echo "$PAYLOAD" | base64 -d | jq '{iss, aud, sub, repository, repository_owner, ref, event_name}'
+          echo "----------------------------------------------------------"
+          echo "Your trust policy must match:"
+          echo "  Federated -> arn:aws:iam::<account>:oidc-provider/<iss without https://>"
+          echo "  :aud      -> the aud value above (StringEquals)"
+          echo "  :sub      -> the sub value above (StringLike, wildcards allowed)"
