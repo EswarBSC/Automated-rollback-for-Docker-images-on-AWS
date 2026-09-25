@@ -33,8 +33,11 @@ jobs:
           # The >>> <<< markers make leading/trailing whitespace visible.
           printf 'value  >>>%s<<<\n' "$ARN"
           printf 'length: %s characters\n' "${#ARN}"
-          # A correct ARN for this project is 60 characters:
-          # arn:aws:iam::010526241989:role/github-actions-rollback-demo
+          # A well-formed value looks like:
+          #   arn:aws:iam::<account-id>:role/<role-name>
+          # with nothing before or after it. A stray space or a pasted label
+          # ("AWS_ROLE_ARN  arn:aws:...") is invisible in the GitHub UI and
+          # produces the same error as a missing role.
           case "$ARN" in
             arn:aws:iam::*:role/*) echo "shape: looks like a role ARN" ;;
             *) echo "shape: NOT a role ARN - this is the problem" ;;
