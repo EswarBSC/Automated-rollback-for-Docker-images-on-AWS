@@ -9,8 +9,12 @@ through GitHub Actions without anyone touching the console.
 
 | File | What it is | Where it goes |
 |---|---|---|
-| `github-actions-policy.json` | Least-privilege permissions policy for the GitHub Actions role | IAM → Policies → Create policy → JSON |
+| `github-oidc-trust-policy.json` | **Who may assume** the GitHub Actions role — the OIDC security boundary | IAM → Roles → Create role → Custom trust policy |
+| `github-actions-policy.json` | **What that role may do** — least-privilege permissions | IAM → Policies → Create policy → JSON |
 | `ecs-infrastructure-trust-policy.json` | Trust policy letting the ECS service itself assume a role | IAM → Roles → Create role → Custom trust policy |
+
+The first two are the complete OIDC setup: one answers *who*, the other answers
+*what*. Together they replace every long-lived AWS credential in CI.
 
 Fixed values already filled in for you: account `010526241989`, region
 `eu-north-1` (Europe, Stockholm).
@@ -97,8 +101,8 @@ Note what is **absent**: no `ecr:DeleteRepository`, no `ecs:DeleteService`, no
 
 **IAM → Roles → Create role → Custom trust policy**
 
-Paste this trust policy (it is repo-specific, which is why it is not a file in
-this folder):
+Paste [`github-oidc-trust-policy.json`](github-oidc-trust-policy.json), which
+is reproduced here so you can see it in context:
 
 ```json
 {
